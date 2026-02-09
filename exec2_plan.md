@@ -1,8 +1,17 @@
-# exec2 Feature Plan
+# exec2 / exec_async Feature Plan
 
 ## Overview
 
-Add an `exec2` capability for asynchronous execution of long-running commands. Unlike `exec` which blocks until completion, `exec2` starts the process immediately and provides streaming output via an async iterator - avoiding timeout and connectivity issues with long-running commands in K8s/Docker environments.
+Add an `exec2` method to `SandboxEnvironment` for asynchronous execution of long-running commands. Unlike `exec` which blocks until completion, `exec2` starts the process immediately and provides streaming output via an async iterator - avoiding timeout and connectivity issues with long-running commands in K8s/Docker environments.
+
+## Naming Convention
+
+| Context | Name | Example |
+|---------|------|---------|
+| **Host-side API** (SandboxEnvironment method) | `exec2` | `sandbox.exec2(["make", "build"])` |
+| **Sandbox-side** (CLI, JSON-RPC, server code) | `exec_async` | `exec_async_submit`, `_exec_async/` |
+
+The host-side uses `exec2` as a short, familiar name (parallel to `exec`). The sandbox-side uses `exec_async` to be more descriptive in the internal implementation.
 
 ## Decisions Made
 
@@ -13,63 +22,88 @@ Add an `exec2` capability for asynchronous execution of long-running commands. U
 - **Process lifecycle**: `exec2()` **immediately starts** the process - it's "hot" from creation
 - **Dual-mode return**: `Exec2Process` is both awaitable (for final result) and async-iterable (for streaming)
 
-## Architecture
+---
+
+## Execution Contexts
+
+This feature spans three distinct execution contexts:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  Caller (solver, tool, etc.)                                │
-│    result = await sandbox.exec2(cmd, options)    # simple   │
-│    async for event in sandbox.exec2(...): ...    # stream   │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│  SandboxEnvironment.exec2() [single implementation in ABC]  │
-│    - Returns Exec2Process (dual-mode: awaitable + iterable) │
-│    - Calls CLI: exec2 submit <command>                      │
-│    - Polls: exec2 poll <job_id>                             │
-│    - Yields typed events (StdoutChunk, StderrChunk, etc.)   │
-└────────────────────────────┬────────────────────────────────┘
-                             │ (via existing sandbox exec mechanism)
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│  CLI / JSON-RPC Layer (sandbox tools server)                │
-│    - exec2 submit → job_id                                  │
-│    - exec2 poll → {state, exit_code?, stdout, stderr}       │
-│    - exec2 kill → success/failure                           │
-└────────────────────────────┬────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Job Controller + Job (in sandbox tools server)             │
-│    - Manages job lifecycle and cleanup                      │
-│    - Wraps asyncio subprocess                               │
-│    - Background read tasks for stdout/stderr                │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  INSPECT_AI PROCESS (host machine)                                          │
+│  ─────────────────────────────────────────────────────────────────────────  │
+│  Code: src/inspect_ai/util/_sandbox/                                        │
+│  - SandboxEnvironment.exec2() method                                        │
+│  - Exec2Process class (dual-mode handle)                                    │
+│  - Event types (StdoutChunk, StderrChunk, Completed)                        │
+│  - Polling loop that calls sandbox.exec() to invoke CLI                     │
+└─────────────────────────────────┬───────────────────────────────────────────┘
+                                  │ sandbox.exec("inspect_sandbox_tools exec_async ...")
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  SANDBOX CONTAINER                                                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  CLI LAYER (stateless, short-lived process)                           │  │
+│  │  ─────────────────────────────────────────────────────────────────────│  │
+│  │  Code: src/inspect_sandbox_tools/.../cli/main.py                      │  │
+│  │  - Parses: exec_async submit|poll|kill                                │  │
+│  │  - Forwards JSON-RPC request to server via Unix socket                │  │
+│  │  - Returns JSON-RPC response to stdout                                │  │
+│  │  - Starts server if not running                                       │  │
+│  │  - Lifetime: single request/response, then exits                      │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                  │                                          │
+│                                  │ Unix socket JSON-RPC                     │
+│                                  ▼                                          │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  SERVER LAYER (stateful, long-running process)                        │  │
+│  │  ─────────────────────────────────────────────────────────────────────│  │
+│  │  Code: src/inspect_sandbox_tools/.../_remote_tools/_exec_async/       │  │
+│  │  - JSON-RPC methods: exec_async_submit, exec_async_poll, exec_async_kill│
+│  │  - Controller: manages Job instances, thread-safe job registry        │  │
+│  │  - Job: wraps asyncio subprocess, background stdout/stderr readers    │  │
+│  │  - Lifetime: persists across CLI invocations, holds job state         │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Context Summary
+
+| Context | Location | Lifetime | State | Responsibilities |
+|---------|----------|----------|-------|------------------|
+| **inspect_ai process** | Host machine | Eval duration | Transient | API surface, polling orchestration, event streaming |
+| **CLI layer** | Sandbox container | Single request | Stateless | Parse commands, route to server, return response |
+| **Server layer** | Sandbox container | Long-running | Stateful | Job lifecycle, subprocess management, output buffering |
 
 ---
 
-## Part 1: CLI / JSON-RPC Layer (Sandbox Tools Server)
+## Part 1: Server Layer (Stateful, in Sandbox)
+
+**Location**: `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec_async/`
+
+This code runs inside the sandbox container as part of the long-running `inspect_sandbox_tools` server process. It maintains state (running jobs, output buffers) across multiple CLI invocations.
 
 ### API
 
-Three operations with a simplified, combined status+output design:
+Three JSON-RPC methods exposed by the server:
 
-| Operation | CLI | JSON-RPC Method | Input | Output |
-|-----------|-----|-----------------|-------|--------|
-| **submit** | `exec2 submit <command>` | `exec2_submit` | command (string) | job_id (string) |
-| **poll** | `exec2 poll <job_id>` | `exec2_poll` | job_id | state, exit_code?, stdout, stderr |
-| **kill** | `exec2 kill <job_id>` | `exec2_kill` | job_id | success/failure |
+| JSON-RPC Method | Input | Output |
+|-----------------|-------|--------|
+| `exec_async_submit` | command (string) | pid (int) |
+| `exec_async_poll` | pid | state, exit_code?, stdout, stderr |
+| `exec_async_kill` | pid | success/failure |
 
 ### Poll Response Fields
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `state` | string | Job lifecycle state: `running`, `completed`, or `killed` |
-| `exit_code` | int \| None | Process exit code (0 = success, non-zero = failure). Only present when state is `completed`. |
-| `stdout` | string | Standard output captured from the process |
-| `stderr` | string | Standard error captured from the process |
+| `exit_code` | int \| None | Process exit code. Only present when state is `completed`. |
+| `stdout` | string | Standard output since last poll (incremental) |
+| `stderr` | string | Standard error since last poll (incremental) |
 
 ### State Values
 - `running` - job is still executing
@@ -77,74 +111,135 @@ Three operations with a simplified, combined status+output design:
 - `killed` - job was terminated via kill command
 
 ### Cleanup Behavior
-Job is automatically removed from the controller after a `poll` call returns a terminal state (`completed` or `killed`). Subsequent polls for that job_id will return an error.
+Job is automatically removed from the controller after a `poll` call returns a terminal state (`completed` or `killed`). Subsequent polls for that pid will return an error.
 
 ### Components
 
-1. **CLI Layer** (`main.py`)
-   - New `exec2` subcommand with sub-subcommands: `submit`, `poll`, `kill`
-   - Routes to JSON-RPC methods via Unix socket to server
+All files below are in `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec_async/`:
 
-2. **JSON-RPC Methods** (`_remote_tools/_exec2/json_rpc_methods.py`)
-   - `exec2_submit(command)` → job_id
-   - `exec2_poll(job_id)` → {state, exit_code?, stdout, stderr}
-   - `exec2_kill(job_id)` → success message
+1. **JSON-RPC Methods** (`json_rpc_methods.py`)
+   - `exec_async_submit(command)` → pid
+   - `exec_async_poll(pid)` → {state, exit_code?, stdout, stderr}
+   - `exec_async_kill(pid)` → success message
+   - Uses `@validated_json_rpc_method` decorator (shared with bash_session)
 
-3. **Job Controller** (`_remote_tools/_exec2/_controller.py`)
-   - Manages job lifecycle and cleanup
-   - Thread-safe job storage (similar to SessionController pattern)
+2. **Controller** (`_controller.py`)
+   - Simple `dict[int, Job]` registry keyed by PID
+   - `submit(command) → pid`: create Job, store by pid
+   - `poll(pid) → result`: get output, cleanup if terminal
+   - `kill(pid)`: terminate job
+   - No `SessionController` - PIDs are natural unique identifiers
 
-4. **Job Class** (`_remote_tools/_exec2/_job.py`)
-   - Wraps asyncio subprocess (using `asyncio.create_subprocess_shell`)
-   - Background read tasks for stdout and stderr (separate pipes, not PTY)
-   - Tracks status and exit code
+3. **Job** (`_job.py`)
+   - Wraps `asyncio.create_subprocess_shell` with separate PIPE for stdout/stderr
+   - Background read tasks accumulate output into buffers
+   - `poll()` returns and clears incremental output
+   - `kill()` terminates subprocess gracefully then forcefully
+
+4. **Types** (`tool_types.py`)
+   - Pydantic models for request/response validation
+
+### Files to Create (Server Layer)
+
+```
+src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec_async/
+├── __init__.py
+├── json_rpc_methods.py    # JSON-RPC handlers
+├── _controller.py         # Job registry (extends SessionController)
+├── _job.py                # Subprocess wrapper with background readers
+└── tool_types.py          # Pydantic models
+```
+
+### Files to Modify (Server Layer)
+
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_util/load_tools.py` - register exec_async methods
+
+### Code Sharing Recommendation
+
+**Summary**: ~20% direct reuse, ~30% pattern reuse, ~50% new code.
+
+#### Reuse Directly (no changes needed)
+
+| Component | File | How to Use |
+|-----------|------|------------|
+| `@validated_json_rpc_method` | `_util/json_rpc_helpers.py` | Decorate JSON-RPC handlers identically |
+| `load_tools` registry | `_util/load_tools.py` | Add `"exec_async": exec_async_methods` entry |
+
+#### Follow Same Patterns (new code, same architecture)
+
+| Pattern | bash_session Example | exec_async Equivalent |
+|---------|---------------------|----------------------|
+| JSON-RPC method structure | `bash_session_new_session`, `bash_session` | `exec_async_submit`, `exec_async_poll`, `exec_async_kill` |
+| Background read task | `_read_loop()` in `Process` | Two read loops (stdout + stderr) in `Job` |
+| Graceful termination | terminate → kill sequence | Same pattern |
+| Pydantic tool_types.py | `BashParams`, `InteractResult`, etc. | `SubmitParams`, `PollResult`, etc. |
+
+#### Do NOT Reuse (different requirements)
+
+| Component | Why |
+|-----------|-----|
+| `SessionController` | exec_async uses PIDs as natural unique identifiers, no session naming needed |
+| `PseudoTerminal` | exec_async uses separate pipes, not PTY |
+| `AsyncDecodedStreamReader` | PTY-specific; pipes don't need incremental UTF-8 decoding |
+| `Process` class | Tied to PTY I/O, interactive bash, single combined stream |
+| `Session` class | Has restart capability exec_async doesn't need |
+| `TimeoutEvent` | Server-driven adaptive waits; exec_async uses client-driven polling |
+| `strip_control_characters()` | PTY produces ANSI escapes; pipes produce clean output |
+
+---
+
+## Part 2: CLI Layer (Stateless, in Sandbox)
+
+**Location**: `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_cli/main.py`
+
+This code runs inside the sandbox container as a short-lived process. Each CLI invocation is stateless - it parses arguments, sends a JSON-RPC request to the server, and prints the response.
+
+### CLI Commands
+
+```bash
+# Submit a new job (returns pid)
+inspect_sandbox_tools exec_async submit "long-running-command"
+
+# Poll job status and get incremental output
+inspect_sandbox_tools exec_async poll <pid>
+
+# Kill a running job
+inspect_sandbox_tools exec_async kill <pid>
+```
 
 ### Data Flow
 
 ```
-CLI: exec2 submit "long-running-command"
-    → JSON-RPC: exec2_submit(command="long-running-command")
-    → Controller.submit(command)
-    → Job.create(command)  # spawns subprocess
-    → returns job_id (e.g., "job_0")
-
-CLI: exec2 poll job_0
-    → JSON-RPC: exec2_poll(job_id="job_0")
-    → Controller.poll(job_id)
-    → Job.poll()  # gets current state
-    → returns {state: "running", stdout: "...", stderr: "..."}
-
-CLI: exec2 poll job_0  (after completion)
-    → JSON-RPC: exec2_poll(job_id="job_0")
-    → Controller.poll(job_id)
-    → returns {state: "completed", exit_code: 0, stdout: "...", stderr: "..."}
-    → Controller removes job from storage (auto-cleanup)
-
-CLI: exec2 kill job_0
-    → JSON-RPC: exec2_kill(job_id="job_0")
-    → Controller.kill(job_id)
-    → Job.kill()  # terminates subprocess
-    → returns success message
+Host calls:  sandbox.exec(["inspect_sandbox_tools", "exec_async", "submit", "make build"])
+                │
+                ▼
+CLI process:   Parse args → JSON-RPC request → Unix socket → Server
+                                                                │
+                                                                ▼
+Server:        exec_async_submit() → Controller.submit() → Job.create()
+                                                                │
+                ◄───────────────────────────────────────────────┘
+CLI process:   Print JSON response → exit
+                │
+                ▼
+Host receives: {"result": {"pid": 12345}}
 ```
-
-### Files to Create (CLI Layer)
-
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/__init__.py`
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/json_rpc_methods.py`
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/_controller.py`
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/_job.py`
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/tool_types.py`
 
 ### Files to Modify (CLI Layer)
 
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_cli/main.py` - add exec2 subcommand
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_util/load_tools.py` - register exec2 methods
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_cli/main.py`
+  - Add `exec_async` subcommand with `submit`, `poll`, `kill` sub-subcommands
+  - Route to JSON-RPC methods via existing Unix socket mechanism
 
 ---
 
-## Part 2: SandboxEnvironment API (Client Side)
+## Part 3: inspect_ai Process (Host Machine)
 
-### Event Types (Union of Dataclasses)
+**Location**: `src/inspect_ai/util/_sandbox/`
+
+This code runs in the main inspect_ai process on the host machine. It provides the Python API that solvers and tools use, and orchestrates polling to stream events back to the caller.
+
+### Event Types
 
 ```python
 from dataclasses import dataclass
@@ -210,20 +305,16 @@ class Exec2Process:
         ...
 
     async def kill(self) -> None:
-        """Terminate the process.
-
-        Can be called at any time after exec2() returns.
-        Safe to call multiple times or after process has completed (no-op).
-        """
+        """Terminate the process."""
         ...
 ```
 
 ### Method Signature
 
 ```python
-# In SandboxEnvironment ABC (environment.py)
+# In SandboxEnvironment ABC
 
-async def exec2(
+def exec2(
     self,
     cmd: list[str],
     options: Exec2Options | None = None,
@@ -242,28 +333,10 @@ async def exec2(
         - Awaited for final ExecResult (like exec)
         - Iterated for streaming events
         - Killed via kill() method
-
-    Example (simple):
-        result = await (await sandbox.exec2(["make", "build"]))
-        # Or more naturally:
-        proc = await sandbox.exec2(["make", "build"])
-        result = await proc
-
-    Example (streaming):
-        proc = await sandbox.exec2(["make", "build"])
-        async for event in proc:
-            match event:
-                case StdoutChunk(data=data):
-                    print(data, end="")
-                case Completed(exit_code=code):
-                    print(f"\\nBuild finished with code {code}")
-
-    Example (fire-and-forget):
-        proxy = await sandbox.exec2(["./proxy"])  # starts immediately
-        # ... do other work ...
-        await proxy.kill()  # terminate when done
     """
 ```
+
+Note: `exec2()` is a regular method (not async) that returns `Exec2Process`. The process is started synchronously via a blocking `exec()` call to submit the job. This allows fire-and-forget patterns without an initial await.
 
 ### Options Object
 
@@ -288,23 +361,20 @@ class Exec2Options:
     """Maximum execution time in seconds."""
 
     poll_interval: float | None = None
-    """Interval between poll requests (defaults to sandbox's default_polling_interval())."""
+    """Interval between poll requests (defaults to 0.5 seconds)."""
 ```
 
-### Comparison with exec()
+### Implementation Details
 
-| Aspect | `exec()` | `exec2()` |
-|--------|----------|-----------|
-| Parameters | 8 individual params | 1 options object |
-| Return | `ExecResult[str]` | `Exec2Process` (awaitable + iterable) |
-| Blocking | Blocks until complete | Blocks but polls internally |
-| Output | Final result only | Stream events OR final result |
-| Timeout handling | `timeout_retry` param | No retry, just timeout |
-| Concurrency | `concurrency` param | Not needed (polling is lightweight) |
-| Implementation | Abstract (per-sandbox) | Single impl in ABC |
-| Binary mode | Supported (text=False) | Text only |
+The `Exec2Process` class internally:
+1. Calls `sandbox.exec(["inspect_sandbox_tools", "exec_async", "submit", cmd])` to start the job
+2. Stores the returned `pid`
+3. When iterated or awaited, polls via `sandbox.exec(["inspect_sandbox_tools", "exec_async", "poll", pid])`
+4. Yields `StdoutChunk`/`StderrChunk` events for incremental output
+5. Yields `Completed` event when poll returns terminal state
+6. `kill()` calls `sandbox.exec(["inspect_sandbox_tools", "exec_async", "kill", pid])`
 
-### Files to Modify (Client Side)
+### Files to Modify (inspect_ai)
 
 1. **environment.py** (`src/inspect_ai/util/_sandbox/environment.py`)
    - Add `Exec2Options` dataclass
@@ -312,7 +382,6 @@ class Exec2Options:
    - Add `Exec2Event` type alias
    - Add `Exec2Process` class
    - Add `exec2()` method to `SandboxEnvironment` ABC
-   - Add private helpers: `_exec2_submit`, `_exec2_poll`, `_exec2_kill`
 
 2. **__init__.py** (`src/inspect_ai/util/_sandbox/__init__.py`)
    - Export: `Exec2Options`, `Exec2Process`, `Exec2Event`, `StdoutChunk`, `StderrChunk`, `Completed`
@@ -337,44 +406,28 @@ result = await sandbox.exec2(["make", "build"], Exec2Options(timeout=300))
 async for event in sandbox.exec2(["pytest", "-v"]):
     match event:
         case StdoutChunk(data=data):
-            # Print test output in real-time
             print(data, end="", flush=True)
         case StderrChunk(data=data):
             print(data, end="", file=sys.stderr, flush=True)
-        case Completed(exit_code=code, stdout=out, stderr=err):
+        case Completed(exit_code=code):
             print(f"\nTests finished with code {code}")
-            # Full output also available here if needed
 ```
 
-### With Options
-
-```python
-options = Exec2Options(
-    cwd="/app",
-    env={"DEBUG": "1"},
-    timeout=600,
-    user="appuser",
-)
-result = await sandbox.exec2(["./long-running-script.sh"], options)
-```
-
-### Agent Bridge Pattern (Fire-and-Forget + Kill)
+### Fire-and-Forget with Kill
 
 ```python
 # Start proxy immediately (no await needed to start)
 proxy = sandbox.exec2(["./model-proxy"])
-# proxy is already running in the sandbox
 
-# Run the claude code agent, streaming its output
+# Run agent, streaming output
 async for event in sandbox.exec2(["claude-code", "--task", task]):
     match event:
         case StdoutChunk(data=data):
-            # Stream agent output to user in real-time
             print(data, end="", flush=True)
         case Completed(exit_code=code):
             print(f"\nAgent finished with code {code}")
 
-# Clean up the proxy when done
+# Clean up proxy
 await proxy.kill()
 ```
 
@@ -382,65 +435,169 @@ await proxy.kill()
 
 ## Implementation Checklist
 
-### Phase 1: CLI Layer (Sandbox Tools Server)
-- [ ] Create `_exec2/` package structure
+### Phase 1: Server Layer (Sandbox - Stateful)
+- [ ] Create `_exec_async/` package structure
+- [ ] Add `remove_session()` to `SessionController` base class
 - [ ] Define Pydantic models in `tool_types.py`
 - [ ] Implement `Job` class with subprocess management
 - [ ] Implement `Controller` extending `SessionController`
-- [ ] Implement JSON-RPC methods (poll returns incremental output)
+- [ ] Implement JSON-RPC methods
 - [ ] Register in `load_tools.py`
-- [ ] Add CLI subcommand parsing in `main.py`
-- [ ] Add CLI dispatch logic
 
-### Phase 2: SandboxEnvironment API
+### Phase 2: CLI Layer (Sandbox - Stateless)
+- [ ] Add `exec_async` subcommand to `main.py`
+- [ ] Add sub-subcommands: `submit`, `poll`, `kill`
+- [ ] Route to JSON-RPC methods via Unix socket
+
+### Phase 3: inspect_ai Process (Host)
 - [ ] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)
 - [ ] Add `Exec2Options` dataclass
 - [ ] Add `Exec2Process` class with dual-mode support
 - [ ] Add `exec2()` method to SandboxEnvironment ABC
-- [ ] Implement `_exec2_submit()` helper
-- [ ] Implement `_exec2_poll()` helper
-- [ ] Implement `_exec2_kill()` helper
 - [ ] Export new types from public API
 
-### Phase 3: Testing
-- [ ] Unit tests for Job class
-- [ ] Unit tests for Controller
-- [ ] Unit tests for Exec2Process (mock CLI)
+### Phase 4: Testing
+- [ ] Unit tests for Job class (server layer)
+- [ ] Unit tests for Controller (server layer)
+- [ ] Unit tests for Exec2Process (mock CLI calls)
 - [ ] Test await mode returns ExecResult
 - [ ] Test iteration mode yields correct event sequence
 - [ ] Test timeout handling
-- [ ] Test cancellation (job gets killed)
+- [ ] Test kill functionality
 - [ ] Integration test with actual sandbox
+
+---
+
+## Comparison: bash_session vs exec2
+
+### Fundamental Difference: Tool vs Infrastructure
+
+**bash_session is a Tool** - It's exposed to models/agents as a callable tool. The model can invoke `bash_session` to run commands in a persistent shell. This means:
+- Has tool registration and schema
+- Appears in tool listings
+- Model decides when to call it
+- Part of the agent's action space
+
+**exec2 is NOT a Tool** - It's infrastructure for solver/evaluation code. The `exec2()` method is called by Python code running in the inspect_ai process, not by models. This means:
+- No tool registration or schema
+- Not visible to models
+- Solver/tool implementation code calls it directly
+- Similar to `sandbox.exec()` - a programmatic API, not an agent action
+
+### I/O Model: PTY vs Separate Pipes
+
+**bash_session uses a PTY (pseudo-terminal)**
+
+A PTY emulates a real terminal device. bash_session creates a PTY pair and attaches bash's stdin/stdout/stderr all to the same PTY file descriptor:
+
+```python
+# bash_session's approach
+pty = await PseudoTerminal.create()
+process = await asyncio.create_subprocess_exec(
+    "/bin/bash", "-i",
+    stdin=pty.subprocess_fd,
+    stdout=pty.subprocess_fd,   # Same fd
+    stderr=pty.subprocess_fd,   # Same fd
+)
+```
+
+Implications of PTY:
+- **Combined streams**: stdout and stderr are interleaved in arrival order (like a real terminal)
+- **Interactive shell**: Bash runs in interactive mode (`-i`), loading `.bashrc`, enabling job control
+- **Line buffering**: PTY provides proper line buffering for interactive use
+- **Terminal features**: Supports terminal escape sequences, though bash_session strips them
+- **Complexity**: Requires PTY management, terminal attribute configuration, echo disabling
+- **Use case**: Persistent shell sessions where the model sends multiple commands over time
+
+**exec_async uses separate pipes**
+
+exec_async creates the subprocess with independent pipes for stdout and stderr:
+
+```python
+# exec_async's approach
+process = await asyncio.create_subprocess_shell(
+    command,
+    stdout=asyncio.subprocess.PIPE,  # Separate pipe
+    stderr=asyncio.subprocess.PIPE,  # Separate pipe
+)
+```
+
+Implications of separate pipes:
+- **Distinct streams**: stdout and stderr are captured independently, can be processed/displayed separately
+- **Non-interactive shell**: No `.bashrc`, no job control, simpler environment
+- **Block buffering**: Pipes use block buffering by default (programs may buffer output until exit)
+- **Simpler implementation**: No PTY setup, just standard subprocess pipes
+- **Ordering caveat**: Cannot reconstruct exact interleaving of stdout/stderr (each has its own buffer)
+- **Use case**: Running a single command and streaming its output back to the caller
+
+### Comparison Table
+
+| Aspect | bash_session | exec2 / exec_async |
+|--------|--------------|------------|
+| **Type** | Tool (model-callable) | Infrastructure (code-callable) |
+| **Purpose** | Persistent interactive shell | One-shot command execution |
+| **Session lifecycle** | Long-lived, survives calls | Single command, auto-cleanup |
+| **I/O model** | PTY (combined stdout/stderr) | Separate pipes (distinct streams) |
+| **Shell mode** | Interactive (`bash -i`) | Non-interactive (`sh -c`) |
+| **Buffering** | Line buffered (PTY) | Block buffered (pipes) |
+| **Output delivery** | Accumulated, cleared after interact | Incremental per poll |
+| **Stream separation** | No (interleaved) | Yes (stdout/stderr independent) |
+| **Restart capability** | Yes | No (kill and submit new) |
+
+### Shared Infrastructure
+
+Despite these differences, both features share underlying infrastructure in the sandbox tools server:
+
+| Component | Used By | Notes |
+|-----------|---------|-------|
+| `SessionController[T]` | Both | bash_session uses `Session`, exec_async uses `Job` |
+| `@validated_json_rpc_method` | Both | Same decorator for JSON-RPC registration |
+| JSON-RPC server | Both | Same aiohttp server process |
+| Unix socket communication | Both | Same IPC mechanism |
+| CLI dispatch pattern | Both | Same routing in `main.py` |
+
+### What exec_async Does NOT Share
+
+| Component | Why Not Shared |
+|-----------|----------------|
+| `PseudoTerminal` | exec_async uses pipes, not PTY |
+| `AsyncDecodedStreamReader` | PTY-specific UTF-8 handling not needed |
+| `Process` class | Deeply tied to PTY I/O and interactive bash |
+| `Session` class | Has restart capability exec_async doesn't need |
+| `TimeoutEvent` | bash_session's adaptive wait; exec_async uses client-driven polling |
+| `strip_control_characters()` | PTY produces ANSI escapes; pipes don't |
 
 ---
 
 ## Open Questions
 
-- [ ] **Output buffering strategy**: Should `poll` return incremental stdout/stderr (data since last poll), or buffer all output until subprocess completes? Need to understand caller/use cases better before deciding.
+- [ ] **Output buffering strategy**: Currently planned as incremental (data since last poll). Should we also support a mode that buffers all output? Or is that just "await the process"?
+
+## Future Cleanup
+
+- [ ] **Rename `_remote_tools` directory**: The name `_remote_tools` is misleading now that it contains `_exec_async`, which is infrastructure rather than a tool. Consider renaming to `_remote_services` or `_json_rpc_services` to better reflect that it contains both tools (like `bash_session`) and infrastructure (like `exec_async`). Add a TODO comment in the code when creating the `_exec_async` directory.
 
 ---
 
 ## Verification
 
-1. **Unit test**: Mock CLI responses, verify dual-mode behavior
-2. **Integration test**: Run actual long-running command
+1. **Unit test**: Mock sandbox.exec() calls, verify dual-mode behavior
+2. **Integration test**: Run actual long-running command in Docker sandbox
 3. **Manual test**:
    ```python
    sandbox = await get_sandbox()
 
    # Test streaming
-   proc = await sandbox.exec2(["bash", "-c", "for i in 1 2 3; do echo $i; sleep 1; done"])
-   async for event in proc:
+   async for event in sandbox.exec2(["bash", "-c", "for i in 1 2 3; do echo $i; sleep 1; done"]):
        print(f"Event: {event}")
 
    # Test simple await
-   proc = await sandbox.exec2(["echo", "hello"])
-   result = await proc
+   result = await sandbox.exec2(["echo", "hello"])
    print(f"Result: {result}")
 
    # Test fire-and-forget with kill
-   proxy = await sandbox.exec2(["sleep", "999"])
-   await asyncio.sleep(1)  # let it run briefly
+   proxy = sandbox.exec2(["sleep", "999"])
+   await asyncio.sleep(1)
    await proxy.kill()
    print("Proxy killed")
    ```
