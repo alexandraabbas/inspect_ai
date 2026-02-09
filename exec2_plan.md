@@ -191,30 +191,28 @@ src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec_async/
 
 ## Part 2: CLI Layer (Stateless, in Sandbox)
 
-**Location**: `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_cli/main.py`
+**No new CLI code needed.** The existing `exec` subcommand already handles JSON-RPC dispatch for any method, including exec_async methods. The host-side code constructs JSON-RPC requests and passes them via the existing path.
 
-This code runs inside the sandbox container as a short-lived process. Each CLI invocation is stateless - it parses arguments, sends a JSON-RPC request to the server, and prints the response.
-
-### CLI Commands
+### CLI Usage
 
 ```bash
 # Submit a new job (returns pid)
-inspect_sandbox_tools exec_async submit "long-running-command"
+inspect_sandbox_tools exec '{"jsonrpc": "2.0", "method": "exec_async_submit", "params": {"command": "long-running-command"}, "id": 1}'
 
 # Poll job status and get incremental output
-inspect_sandbox_tools exec_async poll <pid>
+inspect_sandbox_tools exec '{"jsonrpc": "2.0", "method": "exec_async_poll", "params": {"pid": 12345}, "id": 1}'
 
 # Kill a running job
-inspect_sandbox_tools exec_async kill <pid>
+inspect_sandbox_tools exec '{"jsonrpc": "2.0", "method": "exec_async_kill", "params": {"pid": 12345}, "id": 1}'
 ```
 
 ### Data Flow
 
 ```
-Host calls:  sandbox.exec(["inspect_sandbox_tools", "exec_async", "submit", "make build"])
+Host calls:  sandbox.exec(["inspect_sandbox_tools", "exec", '{"jsonrpc": "2.0", "method": "exec_async_submit", ...}'])
                 │
                 ▼
-CLI process:   Parse args → JSON-RPC request → Unix socket → Server
+CLI process:   Parse JSON-RPC → route to server via Unix socket
                                                                 │
                                                                 ▼
 Server:        exec_async_submit() → Controller.submit() → Job.create()
@@ -228,9 +226,7 @@ Host receives: {"result": {"pid": 12345}}
 
 ### Files to Modify (CLI Layer)
 
-- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_cli/main.py`
-  - Add `exec_async` subcommand with `submit`, `poll`, `kill` sub-subcommands
-  - Route to JSON-RPC methods via existing Unix socket mechanism
+None - the existing `exec` subcommand handles this.
 
 ---
 
@@ -425,10 +421,8 @@ await proxy.kill()
 - [x] Implement JSON-RPC methods
 - [x] Register in `load_tools.py`
 
-### Phase 2: CLI Layer (Sandbox - Stateless) ✅ COMPLETE
-- [x] Add `exec_async` subcommand to `main.py`
-- [x] Add sub-subcommands: `submit`, `poll`, `kill`
-- [x] Route to JSON-RPC methods via Unix socket
+### Phase 2: CLI Layer (Sandbox - Stateless) ✅ NOT NEEDED
+- [x] No new CLI code required - existing `exec` subcommand handles JSON-RPC dispatch for exec_async methods
 
 ### Phase 3: inspect_ai Process (Host)
 - [ ] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)
