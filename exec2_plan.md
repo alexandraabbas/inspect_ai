@@ -416,13 +416,13 @@ await proxy.kill()
 
 ## Implementation Checklist
 
-### Phase 1: Server Layer (Sandbox - Stateful)
-- [ ] Create `_exec_async/` package structure
-- [ ] Define Pydantic models in `tool_types.py`
-- [ ] Implement `Job` class with subprocess management
-- [ ] Implement `Controller` (simple dict registry)
-- [ ] Implement JSON-RPC methods
-- [ ] Register in `load_tools.py`
+### Phase 1: Server Layer (Sandbox - Stateful) ✅ COMPLETE
+- [x] Create `_exec_async/` package structure
+- [x] Define Pydantic models in `tool_types.py`
+- [x] Implement `Job` class with subprocess management
+- [x] Implement `Controller` (simple dict registry)
+- [x] Implement JSON-RPC methods
+- [x] Register in `load_tools.py`
 
 ### Phase 2: CLI Layer (Sandbox - Stateless)
 - [ ] Add `exec_async` subcommand to `main.py`
