@@ -424,12 +424,12 @@ await proxy.kill()
 ### Phase 2: CLI Layer (Sandbox - Stateless) ✅ NOT NEEDED
 - [x] No new CLI code required - existing `exec` subcommand handles JSON-RPC dispatch for exec_async methods
 
-### Phase 3: inspect_ai Process (Host)
-- [ ] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)
-- [ ] Add `Exec2Options` dataclass
-- [ ] Add `Exec2Process` class (async-iterable only)
-- [ ] Add `exec2()` method to SandboxEnvironment ABC
-- [ ] Export new types from public API
+### Phase 3: inspect_ai Process (Host) ✅ COMPLETE
+- [x] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)
+- [x] Add `Exec2Options` dataclass
+- [x] Add `Exec2Process` class (async-iterable only)
+- [x] Add `exec2()` method to SandboxEnvironment ABC
+- [x] Export new types from public API
 
 ### Phase 4: Testing
 - [ ] Unit tests for Job class (server layer)

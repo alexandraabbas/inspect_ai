@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field, model_validator
 from inspect_ai._util.logger import warn_once
 
 from .._subprocess import ExecResult
+from .exec2 import Exec2Options, Exec2Process, _create_exec2_process
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +208,46 @@ class SandboxEnvironment(abc.ABC):
            ConnectionError: If sandbox is not currently running.
         """
         raise NotImplementedError("connection not implemented")
+
+    def exec2(
+        self,
+        cmd: list[str],
+        options: Exec2Options | None = None,
+    ) -> Exec2Process:
+        """Start a long-running command and return a handle to it.
+
+        The process starts immediately when this method is called.
+        Unlike exec(), exec2 does not block waiting for completion.
+
+        Usage patterns:
+
+        1. Streaming: iterate over events
+           ```python
+           proc = sandbox.exec2(["pytest", "-v"])
+           async for event in proc.events:
+               match event:
+                   case StdoutChunk(data=data): print(data, end="")
+                   case StderrChunk(data=data): print(data, end="", file=sys.stderr)
+                   case Completed(exit_code=code): print(f"Done: {code}")
+           ```
+
+        2. Fire-and-forget with explicit kill:
+           ```python
+           proxy = sandbox.exec2(["./model-proxy"])  # starts immediately
+           # ... do other work ...
+           await proxy.kill()  # terminate when done
+           ```
+
+        Args:
+            cmd: Command and arguments to execute.
+            options: Execution options (see Exec2Options).
+
+        Returns:
+            Exec2Process handle with:
+            - events: AsyncIterator for streaming output
+            - kill(): method to terminate the process
+        """
+        return _create_exec2_process(self, cmd, options)
 
     def as_type(self, sandbox_cls: Type[ST]) -> ST:
         """Verify and return a reference to a subclass of SandboxEnvironment.
