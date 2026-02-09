@@ -1,14 +1,17 @@
-# exec2 Feature Plan (Revised)
+# exec2 Feature Plan
 
 ## Overview
 
-Add an `exec2` method to the `SandboxEnvironment` ABC that supports asynchronous execution of long-running commands. Unlike `exec` which blocks until completion, `exec2` starts the process immediately and provides streaming output via an async iterator.
+Add an `exec2` capability for asynchronous execution of long-running commands. Unlike `exec` which blocks until completion, `exec2` starts the process immediately and provides streaming output via an async iterator - avoiding timeout and connectivity issues with long-running commands in K8s/Docker environments.
 
-**Key insights**:
-- `exec2` is exposed as a method on `SandboxEnvironment` with a single implementation in the ABC itself (not abstract)
-- Calling `exec2()` **immediately starts** the process - it's "hot" from the moment of creation
-- Iteration/await is for **consuming output**, not for starting the process
-- `Exec2Process.kill()` can be called anytime to terminate the process
+## Decisions Made
+
+- **stdout/stderr**: Separate streams (not combined like bash_session's PTY)
+- **Job cleanup**: Auto-cleanup after `poll` returns a terminal status (completed/failed/killed)
+- **Server restarts**: Jobs do not survive server restarts (in-memory storage)
+- **Client-side Tool**: Not needed - this is server-side/CLI only
+- **Process lifecycle**: `exec2()` **immediately starts** the process - it's "hot" from creation
+- **Dual-mode return**: `Exec2Process` is both awaitable (for final result) and async-iterable (for streaming)
 
 ## Architecture
 
@@ -30,14 +33,116 @@ Add an `exec2` method to the `SandboxEnvironment` ABC that supports asynchronous
                              │ (via existing sandbox exec mechanism)
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  CLI / JSON-RPC Layer (already spec'd in PLAN.md)           │
+│  CLI / JSON-RPC Layer (sandbox tools server)                │
 │    - exec2 submit → job_id                                  │
 │    - exec2 poll → {state, exit_code?, stdout, stderr}       │
 │    - exec2 kill → success/failure                           │
+└────────────────────────────┬────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│  Job Controller + Job (in sandbox tools server)             │
+│    - Manages job lifecycle and cleanup                      │
+│    - Wraps asyncio subprocess                               │
+│    - Background read tasks for stdout/stderr                │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## API Design
+---
+
+## Part 1: CLI / JSON-RPC Layer (Sandbox Tools Server)
+
+### API
+
+Three operations with a simplified, combined status+output design:
+
+| Operation | CLI | JSON-RPC Method | Input | Output |
+|-----------|-----|-----------------|-------|--------|
+| **submit** | `exec2 submit <command>` | `exec2_submit` | command (string) | job_id (string) |
+| **poll** | `exec2 poll <job_id>` | `exec2_poll` | job_id | state, exit_code?, stdout, stderr |
+| **kill** | `exec2 kill <job_id>` | `exec2_kill` | job_id | success/failure |
+
+### Poll Response Fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `state` | string | Job lifecycle state: `running`, `completed`, or `killed` |
+| `exit_code` | int \| None | Process exit code (0 = success, non-zero = failure). Only present when state is `completed`. |
+| `stdout` | string | Standard output captured from the process |
+| `stderr` | string | Standard error captured from the process |
+
+### State Values
+- `running` - job is still executing
+- `completed` - job finished (check `exit_code` for success/failure: 0 = success, non-zero = failure)
+- `killed` - job was terminated via kill command
+
+### Cleanup Behavior
+Job is automatically removed from the controller after a `poll` call returns a terminal state (`completed` or `killed`). Subsequent polls for that job_id will return an error.
+
+### Components
+
+1. **CLI Layer** (`main.py`)
+   - New `exec2` subcommand with sub-subcommands: `submit`, `poll`, `kill`
+   - Routes to JSON-RPC methods via Unix socket to server
+
+2. **JSON-RPC Methods** (`_remote_tools/_exec2/json_rpc_methods.py`)
+   - `exec2_submit(command)` → job_id
+   - `exec2_poll(job_id)` → {state, exit_code?, stdout, stderr}
+   - `exec2_kill(job_id)` → success message
+
+3. **Job Controller** (`_remote_tools/_exec2/_controller.py`)
+   - Manages job lifecycle and cleanup
+   - Thread-safe job storage (similar to SessionController pattern)
+
+4. **Job Class** (`_remote_tools/_exec2/_job.py`)
+   - Wraps asyncio subprocess (using `asyncio.create_subprocess_shell`)
+   - Background read tasks for stdout and stderr (separate pipes, not PTY)
+   - Tracks status and exit code
+
+### Data Flow
+
+```
+CLI: exec2 submit "long-running-command"
+    → JSON-RPC: exec2_submit(command="long-running-command")
+    → Controller.submit(command)
+    → Job.create(command)  # spawns subprocess
+    → returns job_id (e.g., "job_0")
+
+CLI: exec2 poll job_0
+    → JSON-RPC: exec2_poll(job_id="job_0")
+    → Controller.poll(job_id)
+    → Job.poll()  # gets current state
+    → returns {state: "running", stdout: "...", stderr: "..."}
+
+CLI: exec2 poll job_0  (after completion)
+    → JSON-RPC: exec2_poll(job_id="job_0")
+    → Controller.poll(job_id)
+    → returns {state: "completed", exit_code: 0, stdout: "...", stderr: "..."}
+    → Controller removes job from storage (auto-cleanup)
+
+CLI: exec2 kill job_0
+    → JSON-RPC: exec2_kill(job_id="job_0")
+    → Controller.kill(job_id)
+    → Job.kill()  # terminates subprocess
+    → returns success message
+```
+
+### Files to Create (CLI Layer)
+
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/__init__.py`
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/json_rpc_methods.py`
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/_controller.py`
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/_job.py`
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec2/tool_types.py`
+
+### Files to Modify (CLI Layer)
+
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_cli/main.py` - add exec2 subcommand
+- `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_util/load_tools.py` - register exec2 methods
+
+---
+
+## Part 2: SandboxEnvironment API (Client Side)
 
 ### Event Types (Union of Dataclasses)
 
@@ -199,6 +304,21 @@ class Exec2Options:
 | Implementation | Abstract (per-sandbox) | Single impl in ABC |
 | Binary mode | Supported (text=False) | Text only |
 
+### Files to Modify (Client Side)
+
+1. **environment.py** (`src/inspect_ai/util/_sandbox/environment.py`)
+   - Add `Exec2Options` dataclass
+   - Add event types: `StdoutChunk`, `StderrChunk`, `Completed`
+   - Add `Exec2Event` type alias
+   - Add `Exec2Process` class
+   - Add `exec2()` method to `SandboxEnvironment` ABC
+   - Add private helpers: `_exec2_submit`, `_exec2_poll`, `_exec2_kill`
+
+2. **__init__.py** (`src/inspect_ai/util/_sandbox/__init__.py`)
+   - Export: `Exec2Options`, `Exec2Process`, `Exec2Event`, `StdoutChunk`, `StderrChunk`, `Completed`
+
+---
+
 ## Usage Examples
 
 ### Simple Usage (Migration from exec)
@@ -258,161 +378,19 @@ async for event in sandbox.exec2(["claude-code", "--task", task]):
 await proxy.kill()
 ```
 
-## Implementation Details
-
-### Exec2Process Implementation
-
-```python
-class Exec2Process:
-    def __init__(
-        self,
-        sandbox: "SandboxEnvironment",
-        job_id: str,  # Already submitted - process is running
-        poll_interval: float,
-        timeout: float | None,
-    ):
-        self._sandbox = sandbox
-        self._job_id = job_id
-        self._poll_interval = poll_interval
-        self._timeout = timeout
-        self._iterating = False
-        self._completed = False
-        self._killed = False
-        self._stdout_buffer: list[str] = []
-        self._stderr_buffer: list[str] = []
-
-    def __await__(self):
-        return self._await_impl().__await__()
-
-    async def _await_impl(self) -> ExecResult[str]:
-        """Consume all events and return final result."""
-        async for event in self:
-            if isinstance(event, Completed):
-                return ExecResult(
-                    success=event.success,
-                    returncode=event.exit_code,
-                    stdout=event.stdout,
-                    stderr=event.stderr,
-                )
-        raise RuntimeError("Process ended without Completed event")
-
-    async def __aiter__(self) -> AsyncIterator[Exec2Event]:
-        if self._iterating:
-            raise RuntimeError("Exec2Process can only be iterated once")
-        self._iterating = True
-
-        start_time = time.monotonic()
-
-        try:
-            while True:
-                # Check timeout
-                if self._timeout:
-                    elapsed = time.monotonic() - start_time
-                    if elapsed >= self._timeout:
-                        await self.kill()
-                        raise TimeoutError(f"exec2 timed out after {self._timeout}s")
-
-                # Poll for status
-                poll_result = await self._sandbox._exec2_poll(self._job_id)
-
-                # Yield stdout chunks
-                if poll_result.stdout:
-                    self._stdout_buffer.append(poll_result.stdout)
-                    yield StdoutChunk(data=poll_result.stdout)
-
-                # Yield stderr chunks
-                if poll_result.stderr:
-                    self._stderr_buffer.append(poll_result.stderr)
-                    yield StderrChunk(data=poll_result.stderr)
-
-                # Check for completion
-                if poll_result.state in ("completed", "killed"):
-                    self._completed = True
-                    yield Completed(
-                        exit_code=poll_result.exit_code or -1,
-                        stdout="".join(self._stdout_buffer),
-                        stderr="".join(self._stderr_buffer),
-                    )
-                    return
-
-                await asyncio.sleep(self._poll_interval)
-
-        except asyncio.CancelledError:
-            if not self._completed:
-                await self.kill()
-            raise
-
-    async def kill(self) -> None:
-        """Terminate the process.
-
-        Can be called at any time after exec2() returns.
-        Safe to call multiple times or after process has completed (no-op).
-        """
-        if self._killed or self._completed:
-            return
-        self._killed = True
-        await self._sandbox._exec2_kill(self._job_id)
-```
-
-### SandboxEnvironment.exec2 Implementation
-
-```python
-async def exec2(
-    self,
-    cmd: list[str],
-    options: Exec2Options | None = None,
-) -> Exec2Process:
-    """Start a process immediately and return a handle to it.
-
-    The process begins running as soon as this method returns.
-    Use the returned Exec2Process to:
-    - await it for final result
-    - iterate for streaming output
-    - call kill() to terminate
-    """
-    opts = options or Exec2Options()
-    poll_interval = opts.poll_interval or self.default_polling_interval()
-
-    # Submit immediately - process starts running now
-    job_id = await self._exec2_submit(cmd, opts)
-
-    return Exec2Process(
-        sandbox=self,
-        job_id=job_id,
-        poll_interval=poll_interval,
-        timeout=opts.timeout,
-    )
-```
-
-Note: `exec2()` is an async method because it submits the job immediately. The process is running by the time `Exec2Process` is returned.
-
-## Files to Modify
-
-### Modified Files
-
-1. **[environment.py](src/inspect_ai/util/_sandbox/environment.py)**
-   - Add `Exec2Options` dataclass
-   - Add event types: `StdoutChunk`, `StderrChunk`, `Completed`
-   - Add `Exec2Event` type alias
-   - Add `Exec2Process` class
-   - Add `exec2()` method to `SandboxEnvironment` ABC
-   - Add private helpers: `_exec2_submit`, `_exec2_poll`, `_exec2_kill`
-
-2. **[__init__.py](src/inspect_ai/util/_sandbox/__init__.py)**
-   - Export: `Exec2Options`, `Exec2Process`, `Exec2Event`, `StdoutChunk`, `StderrChunk`, `Completed`
-
-### New Files (CLI layer - from existing PLAN.md)
-
-- `src/inspect_sandbox_tools/.../exec2/` package
+---
 
 ## Implementation Checklist
 
-### Phase 1: CLI Layer (from existing PLAN.md)
+### Phase 1: CLI Layer (Sandbox Tools Server)
 - [ ] Create `_exec2/` package structure
-- [ ] Implement Job class with subprocess management
-- [ ] Implement Controller
+- [ ] Define Pydantic models in `tool_types.py`
+- [ ] Implement `Job` class with subprocess management
+- [ ] Implement `Controller` extending `SessionController`
 - [ ] Implement JSON-RPC methods (poll returns incremental output)
-- [ ] Add CLI subcommand parsing
+- [ ] Register in `load_tools.py`
+- [ ] Add CLI subcommand parsing in `main.py`
+- [ ] Add CLI dispatch logic
 
 ### Phase 2: SandboxEnvironment API
 - [ ] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)
@@ -425,12 +403,22 @@ Note: `exec2()` is an async method because it submits the job immediately. The p
 - [ ] Export new types from public API
 
 ### Phase 3: Testing
+- [ ] Unit tests for Job class
+- [ ] Unit tests for Controller
 - [ ] Unit tests for Exec2Process (mock CLI)
 - [ ] Test await mode returns ExecResult
 - [ ] Test iteration mode yields correct event sequence
 - [ ] Test timeout handling
 - [ ] Test cancellation (job gets killed)
 - [ ] Integration test with actual sandbox
+
+---
+
+## Open Questions
+
+- [ ] **Output buffering strategy**: Should `poll` return incremental stdout/stderr (data since last poll), or buffer all output until subprocess completes? Need to understand caller/use cases better before deciding.
+
+---
 
 ## Verification
 
