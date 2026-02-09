@@ -20,7 +20,7 @@ The host-side uses `exec2` as a short, familiar name (parallel to `exec`). The s
 - **Server restarts**: Jobs do not survive server restarts (in-memory storage)
 - **Client-side Tool**: Not needed - this is server-side/CLI only
 - **Process lifecycle**: `exec2()` **immediately starts** the process - it's "hot" from creation
-- **Dual-mode return**: `Exec2Process` is both awaitable (for final result) and async-iterable (for streaming)
+- **Streaming only**: `Exec2Process` is async-iterable only (no await support) - keeps API simple
 
 ---
 
@@ -145,7 +145,7 @@ All files below are in `src/inspect_sandbox_tools/src/inspect_sandbox_tools/_rem
 src/inspect_sandbox_tools/src/inspect_sandbox_tools/_remote_tools/_exec_async/
 ├── __init__.py
 ├── json_rpc_methods.py    # JSON-RPC handlers
-├── _controller.py         # Job registry (extends SessionController)
+├── _controller.py         # Job registry (simple dict keyed by PID)
 ├── _job.py                # Subprocess wrapper with background readers
 └── tool_types.py          # Pydantic models
 ```
@@ -269,40 +269,31 @@ class Completed:
 Exec2Event = Union[StdoutChunk, StderrChunk, Completed]
 ```
 
-### Dual-Mode Return Type
+### Return Type
 
 ```python
 class Exec2Process:
     """Handle to a running exec2 process.
 
     The process starts immediately when exec2() is called - it's "hot" from creation.
-    Iteration/await is for consuming output, not for starting the process.
 
-    This object supports three usage patterns:
+    Usage patterns:
 
-    1. Simple (like exec): await for final result
-       result = await sandbox.exec2(["cmd"])
-       print(result.stdout)
-
-    2. Streaming: iterate for real-time events
-       async for event in sandbox.exec2(["cmd"]):
+    1. Streaming: iterate over events
+       proc = sandbox.exec2(["cmd"])
+       async for event in proc.events:
            match event:
                case StdoutChunk(data=data): print(data)
                case Completed(exit_code=code): print(f"Done: {code}")
 
-    3. Fire-and-forget with explicit kill:
+    2. Fire-and-forget with explicit kill:
        proxy = sandbox.exec2(["./proxy"])  # starts immediately
        # ... do other work ...
        await proxy.kill()  # terminate when done
     """
 
-    def __await__(self) -> Generator[Any, None, ExecResult[str]]:
-        """Await for final result (consumes all events internally)."""
-        ...
-
-    def __aiter__(self) -> AsyncIterator[Exec2Event]:
-        """Iterate over events as they arrive."""
-        ...
+    events: AsyncIterator[Exec2Event]
+    """Async iterator over events as they arrive."""
 
     async def kill(self) -> None:
         """Terminate the process."""
@@ -329,10 +320,9 @@ def exec2(
         options: Execution options (see Exec2Options).
 
     Returns:
-        Exec2Process handle that can be:
-        - Awaited for final ExecResult (like exec)
-        - Iterated for streaming events
-        - Killed via kill() method
+        Exec2Process handle with:
+        - events: AsyncIterator for streaming output
+        - kill(): method to terminate the process
     """
 ```
 
@@ -369,7 +359,7 @@ class Exec2Options:
 The `Exec2Process` class internally:
 1. Calls `sandbox.exec(["inspect_sandbox_tools", "exec_async", "submit", cmd])` to start the job
 2. Stores the returned `pid`
-3. When iterated or awaited, polls via `sandbox.exec(["inspect_sandbox_tools", "exec_async", "poll", pid])`
+3. `events` iterator polls via `sandbox.exec(["inspect_sandbox_tools", "exec_async", "poll", pid])`
 4. Yields `StdoutChunk`/`StderrChunk` events for incremental output
 5. Yields `Completed` event when poll returns terminal state
 6. `kill()` calls `sandbox.exec(["inspect_sandbox_tools", "exec_async", "kill", pid])`
@@ -390,20 +380,11 @@ The `Exec2Process` class internally:
 
 ## Usage Examples
 
-### Simple Usage (Migration from exec)
+### Streaming Output
 
 ```python
-# Before (exec)
-result = await sandbox.exec(["make", "build"], timeout=300)
-
-# After (exec2) - nearly identical
-result = await sandbox.exec2(["make", "build"], Exec2Options(timeout=300))
-```
-
-### Streaming Usage
-
-```python
-async for event in sandbox.exec2(["pytest", "-v"]):
+proc = sandbox.exec2(["pytest", "-v"])
+async for event in proc.events:
     match event:
         case StdoutChunk(data=data):
             print(data, end="", flush=True)
@@ -437,10 +418,9 @@ await proxy.kill()
 
 ### Phase 1: Server Layer (Sandbox - Stateful)
 - [ ] Create `_exec_async/` package structure
-- [ ] Add `remove_session()` to `SessionController` base class
 - [ ] Define Pydantic models in `tool_types.py`
 - [ ] Implement `Job` class with subprocess management
-- [ ] Implement `Controller` extending `SessionController`
+- [ ] Implement `Controller` (simple dict registry)
 - [ ] Implement JSON-RPC methods
 - [ ] Register in `load_tools.py`
 
@@ -452,7 +432,7 @@ await proxy.kill()
 ### Phase 3: inspect_ai Process (Host)
 - [ ] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)
 - [ ] Add `Exec2Options` dataclass
-- [ ] Add `Exec2Process` class with dual-mode support
+- [ ] Add `Exec2Process` class (async-iterable only)
 - [ ] Add `exec2()` method to SandboxEnvironment ABC
 - [ ] Export new types from public API
 
@@ -460,8 +440,7 @@ await proxy.kill()
 - [ ] Unit tests for Job class (server layer)
 - [ ] Unit tests for Controller (server layer)
 - [ ] Unit tests for Exec2Process (mock CLI calls)
-- [ ] Test await mode returns ExecResult
-- [ ] Test iteration mode yields correct event sequence
+- [ ] Test iteration yields correct event sequence
 - [ ] Test timeout handling
 - [ ] Test kill functionality
 - [ ] Integration test with actual sandbox
@@ -550,7 +529,6 @@ Despite these differences, both features share underlying infrastructure in the 
 
 | Component | Used By | Notes |
 |-----------|---------|-------|
-| `SessionController[T]` | Both | bash_session uses `Session`, exec_async uses `Job` |
 | `@validated_json_rpc_method` | Both | Same decorator for JSON-RPC registration |
 | JSON-RPC server | Both | Same aiohttp server process |
 | Unix socket communication | Both | Same IPC mechanism |
@@ -560,6 +538,7 @@ Despite these differences, both features share underlying infrastructure in the 
 
 | Component | Why Not Shared |
 |-----------|----------------|
+| `SessionController` | exec_async uses PIDs as natural unique identifiers, no session naming needed |
 | `PseudoTerminal` | exec_async uses pipes, not PTY |
 | `AsyncDecodedStreamReader` | PTY-specific UTF-8 handling not needed |
 | `Process` class | Deeply tied to PTY I/O and interactive bash |
@@ -581,19 +560,16 @@ Despite these differences, both features share underlying infrastructure in the 
 
 ## Verification
 
-1. **Unit test**: Mock sandbox.exec() calls, verify dual-mode behavior
+1. **Unit test**: Mock sandbox.exec() calls, verify streaming behavior
 2. **Integration test**: Run actual long-running command in Docker sandbox
 3. **Manual test**:
    ```python
    sandbox = await get_sandbox()
 
    # Test streaming
-   async for event in sandbox.exec2(["bash", "-c", "for i in 1 2 3; do echo $i; sleep 1; done"]):
+   proc = sandbox.exec2(["bash", "-c", "for i in 1 2 3; do echo $i; sleep 1; done"])
+   async for event in proc.events:
        print(f"Event: {event}")
-
-   # Test simple await
-   result = await sandbox.exec2(["echo", "hello"])
-   print(f"Result: {result}")
 
    # Test fire-and-forget with kill
    proxy = sandbox.exec2(["sleep", "999"])
