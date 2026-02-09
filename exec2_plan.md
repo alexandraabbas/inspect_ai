@@ -425,10 +425,10 @@ await proxy.kill()
 - [x] Implement JSON-RPC methods
 - [x] Register in `load_tools.py`
 
-### Phase 2: CLI Layer (Sandbox - Stateless)
-- [ ] Add `exec_async` subcommand to `main.py`
-- [ ] Add sub-subcommands: `submit`, `poll`, `kill`
-- [ ] Route to JSON-RPC methods via Unix socket
+### Phase 2: CLI Layer (Sandbox - Stateless) ✅ COMPLETE
+- [x] Add `exec_async` subcommand to `main.py`
+- [x] Add sub-subcommands: `submit`, `poll`, `kill`
+- [x] Route to JSON-RPC methods via Unix socket
 
 ### Phase 3: inspect_ai Process (Host)
 - [ ] Add event dataclasses (`StdoutChunk`, `StderrChunk`, `Completed`)

@@ -43,11 +43,45 @@ def main() -> None:
             server_main()
         case "model_proxy":
             asyncio.run(run_model_proxy_server())
+        case "exec_async":
+            asyncio.run(_exec_async(args))
 
 
 def healthcheck():
     asyncio.run(_exec('{"jsonrpc": "2.0", "method": "version", "id": 666}'))
     asyncio.run(_exec('{"jsonrpc": "2.0", "method": "remote_version", "id": 667}'))
+
+
+async def _exec_async(args: argparse.Namespace) -> None:
+    """Handle exec_async subcommand with submit/poll/kill sub-subcommands."""
+    import json
+
+    match args.exec_async_command:
+        case "submit":
+            request = {
+                "jsonrpc": "2.0",
+                "method": "exec_async_submit",
+                "params": {"command": args.command},
+                "id": 1,
+            }
+        case "poll":
+            request = {
+                "jsonrpc": "2.0",
+                "method": "exec_async_poll",
+                "params": {"pid": args.pid},
+                "id": 1,
+            }
+        case "kill":
+            request = {
+                "jsonrpc": "2.0",
+                "method": "exec_async_kill",
+                "params": {"pid": args.pid},
+                "id": 1,
+            }
+        case _:
+            raise ValueError(f"Unknown exec_async command: {args.exec_async_command}")
+
+    print(await _dispatch_remote_method(json.dumps(request)))
 
 
 # Example/testing requests
@@ -133,6 +167,30 @@ def _parse_args() -> argparse.Namespace:
     subparsers.add_parser("server")
     subparsers.add_parser("healthcheck")
     subparsers.add_parser("model_proxy")
+
+    # exec_async subcommand with sub-subcommands
+    exec_async_parser = subparsers.add_parser(
+        "exec_async", help="Async command execution"
+    )
+    exec_async_subparsers = exec_async_parser.add_subparsers(
+        dest="exec_async_command", required=True, help="exec_async operation"
+    )
+
+    # exec_async submit <command>
+    submit_parser = exec_async_subparsers.add_parser(
+        "submit", help="Submit a command for async execution"
+    )
+    submit_parser.add_argument("command", type=str, help="Command to execute")
+
+    # exec_async poll <pid>
+    poll_parser = exec_async_subparsers.add_parser(
+        "poll", help="Poll job status and get incremental output"
+    )
+    poll_parser.add_argument("pid", type=int, help="Process ID of the job")
+
+    # exec_async kill <pid>
+    kill_parser = exec_async_subparsers.add_parser("kill", help="Kill a running job")
+    kill_parser.add_argument("pid", type=int, help="Process ID of the job to kill")
 
     return parser.parse_args()
 
