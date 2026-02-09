@@ -36,6 +36,9 @@ class Controller:
         """Terminate a running job."""
         job = self._get_job(pid)
         await job.kill()
+        # Clean up the job after killing
+        del self._jobs[pid]
+        await job.cleanup()
         return KillResult(message=f"Job {pid} killed")
 
     def _get_job(self, pid: int) -> Job:

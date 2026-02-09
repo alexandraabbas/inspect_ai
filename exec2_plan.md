@@ -21,6 +21,7 @@ The host-side uses `exec2` as a short, familiar name (parallel to `exec`). The s
 - **Client-side Tool**: Not needed - this is server-side/CLI only
 - **Process lifecycle**: `exec2()` **immediately starts** the process - it's "hot" from creation
 - **Streaming only**: `Exec2Process` is async-iterable only (no await support) - keeps API simple
+- **`kill()` semantics**: Calling `kill()` indicates the caller is uninterested in output or exit code. Any buffered data is discarded. If the caller wants output from a process that may have already completed, they should `poll()` instead.
 
 ---
 
@@ -555,6 +556,8 @@ Despite these differences, both features share underlying infrastructure in the 
 ## Future Cleanup
 
 - [ ] **Rename `_remote_tools` directory**: The name `_remote_tools` is misleading now that it contains `_exec_async`, which is infrastructure rather than a tool. Consider renaming to `_remote_services` or `_json_rpc_services` to better reflect that it contains both tools (like `bash_session`) and infrastructure (like `exec_async`). Add a TODO comment in the code when creating the `_exec_async` directory.
+
+- [ ] **Replace `ToolException` usage**: `exec_async` uses `ToolException` for error handling, but since exec_async isn't a tool, this is semantically incorrect. Consider creating a more general exception type (e.g., `ServiceException` or `JsonRpcException`) or using a standard exception type.
 
 ---
 
