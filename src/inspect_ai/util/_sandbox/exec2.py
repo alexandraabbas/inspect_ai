@@ -7,7 +7,6 @@ long-running commands in sandbox environments with streaming output.
 from __future__ import annotations
 
 import shlex
-from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypeVar
 
@@ -128,12 +127,15 @@ T = TypeVar("T", bound=BaseModel)
 class Exec2Process:
     """Handle to a running exec2 process.
 
+    This class is an async iterator that yields events as they arrive.
+    It can only be iterated once (single-use iterator pattern).
+
     Usage patterns:
 
-    1. Streaming: iterate over events
+    1. Streaming: iterate over the process directly
        ```python
        proc = await sandbox.exec2(["cmd"])
-       async for event in proc.events:
+       async for event in proc:
            match event:
                case StdoutChunk(data=data): print(data)
                case Completed(exit_code=code): print(f"Done: {code}")
@@ -167,6 +169,8 @@ class Exec2Process:
         self._pid: int | None = None
         self._killed = False
         self._completed = False
+        self._iteration_started = False
+        self._pending_events: list[Exec2Event] = []
 
     @property
     def pid(self) -> int:
@@ -196,19 +200,24 @@ class Exec2Process:
         )
 
     def _build_shell_command(self) -> str:
-        """Build a shell command string from command list and options."""
+        """Build a shell command string from command list and options.
+
+        Returns a shell command with environment variables and working directory
+        applied. The order ensures env vars apply to the command, not to `cd`:
+            cd /path && VAR=value command args
+        """
         shell_cmd = shlex.join(self._cmd)
 
-        # Add working directory if specified
-        if self._options.cwd:
-            shell_cmd = f"cd {shlex.quote(self._options.cwd)} && {shell_cmd}"
-
-        # Add environment variables if specified
+        # Add environment variables if specified (applies to command, not cd)
         if self._options.env:
             env_prefix = " ".join(
                 f"{k}={shlex.quote(v)}" for k, v in self._options.env.items()
             )
             shell_cmd = f"{env_prefix} {shell_cmd}"
+
+        # Add working directory if specified (wraps the env+command)
+        if self._options.cwd:
+            shell_cmd = f"cd {shlex.quote(self._options.cwd)} && {shell_cmd}"
 
         return shell_cmd
 
@@ -221,20 +230,34 @@ class Exec2Process:
         self._pid = result.pid
 
     # -------------------------------------------------------------------------
-    # Public API
+    # Async Iterator Protocol
     # -------------------------------------------------------------------------
 
-    @property
-    async def events(self) -> AsyncIterator[Exec2Event]:
-        """Async iterator over events as they arrive.
+    def __aiter__(self) -> "Exec2Process":
+        """Return self as the async iterator.
+
+        This class implements the async iterator protocol directly.
+        It can only be iterated once - subsequent iterations will raise RuntimeError.
+        """
+        if self._iteration_started:
+            raise RuntimeError("Exec2Process can only be iterated once")
+        self._iteration_started = True
+        return self
+
+    async def __anext__(self) -> Exec2Event:
+        """Return the next event from the process.
 
         Yields StdoutChunk and StderrChunk events as output becomes available,
         then yields a final Completed event when the process terminates.
 
         Note: After the Completed event is yielded, the job is automatically
-        cleaned up on the server side. Subsequent calls will raise an error.
+        cleaned up on the server side.
 
         If cancelled, the process will be killed before re-raising the exception.
+
+        Raises:
+            StopAsyncIteration: When the process has completed or been killed.
+            RuntimeError: If the process has not been submitted yet.
         """
         import asyncio
 
@@ -243,32 +266,52 @@ class Exec2Process:
         if self._pid is None:
             raise RuntimeError("Process has not been submitted yet")
 
+        # Return any pending events first
+        if self._pending_events:
+            return self._pending_events.pop(0)
+
+        # If already in terminal state, stop iteration
+        if self._completed or self._killed:
+            raise StopAsyncIteration
+
         try:
-            while not self._completed and not self._killed:
+            while True:
                 result = await self._rpc(
                     "exec_async_poll", {"pid": self._pid}, _PollResult
                 )
 
-                # Yield stdout chunks
+                # Collect events from this poll
+                events: list[Exec2Event] = []
                 if result.stdout:
-                    yield StdoutChunk(data=result.stdout)
-
-                # Yield stderr chunks
+                    events.append(StdoutChunk(data=result.stdout))
                 if result.stderr:
-                    yield StderrChunk(data=result.stderr)
+                    events.append(StderrChunk(data=result.stderr))
 
                 # Check for terminal state
                 if result.state == "completed":
                     self._completed = True
-                    assert result.exit_code is not None
-                    yield Completed(exit_code=result.exit_code)
+                    if result.exit_code is None:
+                        raise RuntimeError(
+                            "Server returned completed state without exit_code"
+                        )
+                    events.append(Completed(exit_code=result.exit_code))
                 elif result.state == "killed":
                     # Process was killed (possibly by another call to kill())
                     self._killed = True
                     # Don't yield Completed for killed processes - kill() discards output
-                else:
-                    # Still running, wait before polling again
-                    await asyncio.sleep(self._poll_interval)
+
+                # If we have events, return the first and queue the rest
+                if events:
+                    self._pending_events = events[1:]
+                    return events[0]
+
+                # If killed with no events, stop iteration
+                if self._killed:
+                    raise StopAsyncIteration
+
+                # Still running with no output, wait before polling again
+                await asyncio.sleep(self._poll_interval)
+
         except anyio.get_cancelled_exc_class():
             # Kill the process on cancellation to avoid leaving orphaned processes
             await self.kill()
@@ -307,7 +350,7 @@ async def exec2_streaming(
         options: Execution options.
 
     Returns:
-        Exec2Process handle with events iterator and kill() method.
+        Exec2Process handle that can be iterated for events, or killed.
     """
     proc = Exec2Process(sandbox, cmd, options or Exec2Options())
     await proc._submit()
@@ -340,7 +383,7 @@ async def exec2_awaitable(
     stdout_chunks: list[str] = []
     stderr_chunks: list[str] = []
 
-    async for event in proc.events:
+    async for event in proc:
         if isinstance(event, StdoutChunk):
             stdout_chunks.append(event.data)
         elif isinstance(event, StderrChunk):
