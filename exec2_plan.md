@@ -431,7 +431,7 @@ await proxy.kill()
 - [x] Add `exec2()` method to SandboxEnvironment ABC
 - [x] Export new types from public API
 
-### Phase 4: Refactor model_proxy to use exec2
+### Phase 4: Refactor model_proxy to use exec2 ✅ COMPLETE
 
 **Motivation**: The model_proxy is a long-running HTTP server that can run for an extremely long time (the duration of an agent task). The current approach uses a blocking `sandbox.exec()` call which has timeout/connectivity issues in K8s/Docker environments. Using exec2 provides proper lifecycle management for this long-running process.
 
@@ -442,9 +442,9 @@ Host (bridge.py)                          Sandbox
 ─────────────────                         ───────
 sandbox_agent_bridge()
   │
-  ├─ sandbox.exec2(["python", "proxy.py", port])
+  ├─ sandbox.exec2([SANDBOX_TOOLS_CLI, "model_proxy"])
   │     │
-  │     └─► exec_async_submit ──────────► Job spawns: python proxy.py 13131
+  │     └─► exec_async_submit ──────────► Job spawns: inspect_sandbox_tools model_proxy
   │                                           │
   │                                           ▼
   │                                       model_proxy_server runs
@@ -487,19 +487,19 @@ Keep the existing `model_proxy` CLI subcommand and invoke it via exec2 for prope
 **Implementation Tasks**:
 
 1. **Update host-side bridge.py**
-   - [ ] Change `run_model_proxy()` to use `sandbox.exec2()` instead of blocking `sandbox.exec()`
-   - [ ] Command: `[SANDBOX_TOOLS_CLI, "model_proxy"]`
-   - [ ] Pass environment variables via `Exec2Options(env={...})`
-   - [ ] Store `Exec2Process` handle on the bridge for cleanup
+   - [x] Change `run_model_proxy()` to use `sandbox.exec2()` instead of blocking `sandbox.exec()`
+   - [x] Command: `[SANDBOX_TOOLS_CLI, "model_proxy"]`
+   - [x] Pass environment variables via `Exec2Options(env={...})`
+   - [x] Store `Exec2Process` handle on the bridge for cleanup
 
 2. **Update lifecycle management**
-   - [ ] Call `await proxy.kill()` in the finally block when bridge context exits
-   - [ ] Remove the task group cancellation approach (no longer needed)
-   - [ ] Handle case where proxy exits unexpectedly (check events for early Completed)
+   - [x] Call `await proxy.kill()` in the finally block when bridge context exits
+   - [x] Keep task group cancellation (still needed for model service cleanup)
+   - [x] Handle case where proxy exits unexpectedly (via `_monitor_proxy` task)
 
 3. **Error handling**
-   - [ ] If proxy fails to start, the Completed event will have non-zero exit_code
-   - [ ] stderr from proxy should be captured and logged on failure
+   - [x] If proxy fails to start, the Completed event will have non-zero exit_code (detected by monitor)
+   - [x] stderr from proxy is captured and logged on failure
 
 **JSON-RPC Flow**:
 

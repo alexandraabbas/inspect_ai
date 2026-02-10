@@ -21,6 +21,7 @@ from inspect_ai.tool._tools._web_search._web_search import (
 )
 from inspect_ai.util._anyio import inner_exception
 from inspect_ai.util._sandbox import SandboxEnvironment
+from inspect_ai.util._sandbox.exec2 import Completed, Exec2Options, Exec2Process
 
 from ..._agent import AgentState
 from ..util import default_code_execution_providers, internal_web_search_providers
@@ -101,6 +102,9 @@ async def sandbox_agent_bridge(
     # should be logged but not cause the sample to fail.
     agent_completed = False
 
+    # Handle to the proxy process (for cleanup)
+    proxy_process: Exec2Process | None = None
+
     try:
         async with anyio.create_task_group() as tg:
             # event to signal startup of model service
@@ -139,8 +143,14 @@ async def sandbox_agent_bridge(
                 started,
             )
 
-            # proxy server that runs in container and forwards to sandbox service
-            tg.start_soon(run_model_proxy, sandbox_env, port, instance, started)
+            # wait for model service to start
+            await started.wait()
+
+            # start proxy server in sandbox using exec2 for proper lifecycle management
+            proxy_process = _start_model_proxy(sandbox_env, port, instance)
+
+            # monitor proxy for unexpected early exit
+            tg.start_soon(_monitor_proxy, proxy_process)
 
             # ensure services are up
             await anyio.sleep(0.1)
@@ -150,6 +160,9 @@ async def sandbox_agent_bridge(
                 yield bridge
                 agent_completed = True
             finally:
+                # kill the proxy process (exec2 lifecycle management)
+                if proxy_process is not None:
+                    await proxy_process.kill()
                 tg.cancel_scope.cancel()
     except Exception as ex:
         # If the agent completed successfully but we got an error during cleanup,
@@ -163,25 +176,59 @@ async def sandbox_agent_bridge(
             raise inner_exception(ex)
 
 
-async def run_model_proxy(
-    sandbox: SandboxEnvironment, port: int, instance: str, started: anyio.Event
-) -> None:
-    # wait for model service to be started up
-    await started.wait()
+def _start_model_proxy(
+    sandbox: SandboxEnvironment, port: int, instance: str
+) -> Exec2Process:
+    """Start the model proxy server using exec2 for proper lifecycle management.
 
-    # run the model proxy script
-    result = await sandbox.exec(
+    The proxy is a long-running HTTP server that forwards requests from the sandbox
+    to the host-side model service. Using exec2 allows us to:
+    - Start the proxy without blocking
+    - Kill it cleanly when the bridge context exits
+    - Monitor for unexpected early exits
+
+    Args:
+        sandbox: The sandbox environment to run the proxy in.
+        port: Port for the proxy server.
+        instance: Instance identifier for the model service.
+
+    Returns:
+        Exec2Process handle for lifecycle management.
+    """
+    return sandbox.exec2(
         cmd=[SANDBOX_TOOLS_CLI, "model_proxy"],
-        env={
-            f"{MODEL_SERVICE.upper()}_PORT": str(port),
-            f"{MODEL_SERVICE.upper()}_INSTANCE": instance,
-        },
-        concurrency=False,
+        options=Exec2Options(
+            env={
+                f"{MODEL_SERVICE.upper()}_PORT": str(port),
+                f"{MODEL_SERVICE.upper()}_INSTANCE": instance,
+            }
+        ),
     )
-    if not result.success:
-        raise RuntimeError(
-            f"Error running model proxy script for agent bridge: {result.stderr}"
-        )
+
+
+async def _monitor_proxy(proxy: Exec2Process) -> None:
+    """Monitor the proxy process for unexpected early exits.
+
+    This task runs in the task group and will raise an error if the proxy
+    exits unexpectedly (before the bridge context is closed).
+
+    Args:
+        proxy: The proxy process handle to monitor.
+    """
+    async for event in proxy.events:
+        if isinstance(event, Completed):
+            # Proxy exited - this is unexpected during normal operation
+            if not event.success:
+                raise RuntimeError(
+                    f"Model proxy exited unexpectedly with code {event.exit_code}: "
+                    f"{event.stderr}"
+                )
+            else:
+                # Proxy exited with success - this is also unexpected since it
+                # should run until killed
+                logger.warning(
+                    f"Model proxy exited unexpectedly with success. stdout: {event.stdout}"
+                )
 
 
 def _register_bridged_tools(
