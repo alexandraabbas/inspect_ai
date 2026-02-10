@@ -1,4 +1,6 @@
 import asyncio
+import os
+import signal
 from asyncio.subprocess import Process as AsyncIOProcess
 from typing import Literal
 
@@ -16,11 +18,17 @@ class Job:
 
     @classmethod
     async def create(cls, command: str) -> "Job":
-        """Create and start a new Job for the given command."""
+        """Create and start a new Job for the given command.
+
+        Uses start_new_session=True so the subprocess becomes its own process
+        group leader. This allows kill() to terminate the entire process tree
+        (including any child processes spawned by the command).
+        """
         process = await asyncio.create_subprocess_shell(
             command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
         return cls(process)
 
@@ -68,20 +76,29 @@ class Job:
         )
 
     async def kill(self, timeout: int = 5) -> None:
-        """Terminate the process gracefully, then forcefully if needed."""
+        """Terminate the process and its entire process group.
+
+        Since the subprocess was started with start_new_session=True, it is the
+        leader of its own process group. We use os.killpg() to send signals to
+        the entire group, ensuring child processes are also terminated.
+        """
         if self._state != "running":
             return
 
         self._state = "killed"
+        pgid = self._process.pid
 
-        # Try graceful termination first
+        # Try graceful termination first (SIGTERM to process group)
         try:
-            self._process.terminate()
+            os.killpg(pgid, signal.SIGTERM)
             await asyncio.wait_for(self._process.wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            # Force kill if graceful termination times out
-            self._process.kill()
+            # Force kill if graceful termination times out (SIGKILL to process group)
+            os.killpg(pgid, signal.SIGKILL)
             await self._process.wait()
+        except ProcessLookupError:
+            # Process already exited
+            pass
 
         await self._wait_for_readers()
 

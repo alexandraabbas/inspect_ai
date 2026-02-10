@@ -680,7 +680,7 @@ Despite these differences, both features share underlying infrastructure in the 
 
 - [ ] **Replace `ToolException` usage**: `exec_async` uses `ToolException` for error handling, but since exec_async isn't a tool, this is semantically incorrect. Consider creating a more general exception type (e.g., `ServiceException` or `JsonRpcException`) or using a standard exception type.
 
-- [ ] **Process group handling for kill()**: `Job.create()` currently uses `create_subprocess_shell()` without `start_new_session=True`, so `kill()` only signals the direct child process, not grandchildren (e.g., jest workers spawned by the command). To properly handle process trees, add `start_new_session=True` when creating the subprocess and use `os.killpg()` instead of `process.terminate()`/`process.kill()` to send signals to the entire process group.
+- [x] **Process group handling for kill()**: `Job.create()` now uses `start_new_session=True` so the subprocess becomes its own process group leader. `kill()` uses `os.killpg()` to send SIGTERM/SIGKILL to the entire process group, ensuring child processes (e.g., jest workers) are also terminated.
 
 - [x] **Output limit support for exec2**: Implemented host-side output limiting in `exec2_awaitable()` using `_CircularStringBuffer`, consistent with how `exec()` handles it. Each output stream (stdout/stderr) is capped at 10 MiB (`SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE`). When output exceeds the limit, only the most recent bytes are kept. No server-side changes needed since the caller polls regularly and clears buffers.
 
