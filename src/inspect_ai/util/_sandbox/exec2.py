@@ -10,9 +10,9 @@ immediately and provides streaming output via an async iterator.
 from __future__ import annotations
 
 import shlex
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Coroutine
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel
 
@@ -24,6 +24,7 @@ from inspect_ai.tool._sandbox_tools_utils._runtime_helpers import (
 from inspect_ai.tool._sandbox_tools_utils.sandbox import SANDBOX_TOOLS_CLI
 
 if TYPE_CHECKING:
+    from .._subprocess import ExecResult
     from .environment import SandboxEnvironment
 
 
@@ -276,7 +277,32 @@ class Exec2Process:
 # ============================================================================
 
 
-def _create_exec2_process(
+def _build_shell_command(cmd: list[str], options: Exec2Options) -> str:
+    """Build a shell command string from command list and options.
+
+    Args:
+        cmd: Command and arguments to execute.
+        options: Execution options.
+
+    Returns:
+        Shell command string with environment variables and working directory.
+    """
+    # exec_async uses create_subprocess_shell, so we need to pass a shell command string
+    shell_cmd = shlex.join(cmd)
+
+    # Add working directory if specified
+    if options.cwd:
+        shell_cmd = f"cd {shlex.quote(options.cwd)} && {shell_cmd}"
+
+    # Add environment variables if specified
+    if options.env:
+        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in options.env.items())
+        shell_cmd = f"{env_prefix} {shell_cmd}"
+
+    return shell_cmd
+
+
+def create_streamable_exec2(
     sandbox: SandboxEnvironment,
     cmd: list[str],
     options: Exec2Options | None = None,
@@ -298,19 +324,7 @@ def _create_exec2_process(
     import asyncio
 
     options = options or Exec2Options()
-
-    # Build the shell command
-    # exec_async uses create_subprocess_shell, so we need to pass a shell command string
-    shell_cmd = shlex.join(cmd)
-
-    # Add working directory if specified
-    if options.cwd:
-        shell_cmd = f"cd {shlex.quote(options.cwd)} && {shell_cmd}"
-
-    # Add environment variables if specified
-    if options.env:
-        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in options.env.items())
-        shell_cmd = f"{env_prefix} {shell_cmd}"
+    shell_cmd = _build_shell_command(cmd, options)
 
     # Submit the job synchronously using asyncio.run or get_event_loop
     # We need to handle both cases: when there's an existing event loop and when there isn't
@@ -351,3 +365,109 @@ def _create_exec2_process(
         poll_interval=poll_interval,
         user=options.user,
     )
+
+
+def create_awaitable_exec2(
+    sandbox: SandboxEnvironment,
+    cmd: list[str],
+    options: Exec2Options | None = None,
+) -> Coroutine[Any, Any, ExecResult[str]]:
+    """Create an awaitable that runs the command and returns ExecResult.
+
+    This is an internal function called by SandboxEnvironment.exec2(stream=False).
+    Unlike _create_exec2_process, this returns a coroutine that can be awaited
+    to get the final result without streaming events.
+
+    Args:
+        sandbox: The sandbox environment to run the command in.
+        cmd: Command and arguments to execute.
+        options: Execution options.
+
+    Returns:
+        Coroutine that yields ExecResult[str] when awaited.
+    """
+    return _exec2_await_impl(sandbox, cmd, options)
+
+
+async def _exec2_await_impl(
+    sandbox: SandboxEnvironment,
+    cmd: list[str],
+    options: Exec2Options | None = None,
+) -> ExecResult[str]:
+    """Implementation of the non-streaming exec2 await.
+
+    Submits the command, polls until completion, and returns ExecResult.
+
+    Args:
+        sandbox: The sandbox environment to run the command in.
+        cmd: Command and arguments to execute.
+        options: Execution options.
+
+    Returns:
+        ExecResult[str] with success, returncode, stdout, and stderr.
+    """
+    import asyncio
+
+    from .._subprocess import ExecResult as ExecResultClass
+
+    options = options or Exec2Options()
+    shell_cmd = _build_shell_command(cmd, options)
+    poll_interval = options.poll_interval or DEFAULT_POLL_INTERVAL
+
+    transport = SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI)
+    server_error_mapper = SandboxToolsServerErrorMapper()
+
+    # Submit the job
+    submit_result = await exec_model_request(
+        method="exec_async_submit",
+        params={"command": shell_cmd},
+        result_type=_SubmitResult,
+        transport=transport,
+        server_error_mapper=server_error_mapper,
+        timeout=RPC_TIMEOUT,
+        user=options.user,
+    )
+    pid = submit_result.pid
+
+    # Accumulate output
+    full_stdout: list[str] = []
+    full_stderr: list[str] = []
+
+    # Poll until completion
+    while True:
+        result = await exec_model_request(
+            method="exec_async_poll",
+            params={"pid": pid},
+            result_type=_PollResult,
+            transport=transport,
+            server_error_mapper=server_error_mapper,
+            timeout=RPC_TIMEOUT,
+            user=options.user,
+        )
+
+        # Accumulate output
+        if result.stdout:
+            full_stdout.append(result.stdout)
+        if result.stderr:
+            full_stderr.append(result.stderr)
+
+        # Check for terminal state
+        if result.state == "completed":
+            assert result.exit_code is not None
+            return ExecResultClass[str](
+                success=result.exit_code == 0,
+                returncode=result.exit_code,
+                stdout="".join(full_stdout),
+                stderr="".join(full_stderr),
+            )
+        elif result.state == "killed":
+            # Process was killed externally
+            return ExecResultClass[str](
+                success=False,
+                returncode=-1,
+                stdout="".join(full_stdout),
+                stderr="".join(full_stderr),
+            )
+        else:
+            # Still running, wait before polling again
+            await asyncio.sleep(poll_interval)

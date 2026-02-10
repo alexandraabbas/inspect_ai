@@ -21,7 +21,12 @@ from pydantic import BaseModel, Field, model_validator
 from inspect_ai._util.logger import warn_once
 
 from .._subprocess import ExecResult
-from .exec2 import Exec2Options, Exec2Process, _create_exec2_process
+from .exec2 import (
+    Exec2Options,
+    Exec2Process,
+    create_awaitable_exec2,
+    create_streamable_exec2,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -209,19 +214,39 @@ class SandboxEnvironment(abc.ABC):
         """
         raise NotImplementedError("connection not implemented")
 
+    @overload
     def exec2(
         self,
         cmd: list[str],
         options: Exec2Options | None = None,
-    ) -> Exec2Process:
-        """Start a long-running command and return a handle to it.
+        *,
+        stream: Literal[True] = True,
+    ) -> Exec2Process: ...
+
+    @overload
+    def exec2(
+        self,
+        cmd: list[str],
+        options: Exec2Options | None = None,
+        *,
+        stream: Literal[False],
+    ) -> Awaitable[ExecResult[str]]: ...
+
+    def exec2(
+        self,
+        cmd: list[str],
+        options: Exec2Options | None = None,
+        *,
+        stream: bool = True,
+    ) -> Exec2Process | Awaitable[ExecResult[str]]:
+        """Start a command and return a handle or awaitable result.
 
         The process starts immediately when this method is called.
         Unlike exec(), exec2 does not block waiting for completion.
 
         Usage patterns:
 
-        1. Streaming: iterate over events
+        1. Streaming (stream=True, default): iterate over events
            ```python
            proc = sandbox.exec2(["pytest", "-v"])
            async for event in proc.events:
@@ -238,16 +263,27 @@ class SandboxEnvironment(abc.ABC):
            await proxy.kill()  # terminate when done
            ```
 
+        3. Simple await (stream=False): get result without streaming
+           ```python
+           result = await sandbox.exec2(["pytest", "-v"], stream=False)
+           if result.success:
+               print(result.stdout)
+           ```
+
         Args:
             cmd: Command and arguments to execute.
             options: Execution options (see Exec2Options).
+            stream: If True (default), returns Exec2Process for streaming.
+                If False, returns an awaitable that yields ExecResult[str].
 
         Returns:
-            Exec2Process handle with:
-            - events: AsyncIterator for streaming output
-            - kill(): method to terminate the process
+            If stream=True: Exec2Process handle with events iterator and kill() method.
+            If stream=False: Awaitable[ExecResult[str]] that can be awaited for the result.
         """
-        return _create_exec2_process(self, cmd, options)
+        if stream:
+            return create_streamable_exec2(self, cmd, options)
+        else:
+            return create_awaitable_exec2(self, cmd, options)
 
     def as_type(self, sandbox_cls: Type[ST]) -> ST:
         """Verify and return a reference to a subclass of SandboxEnvironment.
