@@ -311,7 +311,7 @@ def _build_shell_command(cmd: list[str], options: Exec2Options) -> str:
     return shell_cmd
 
 
-def create_streamable_exec2(
+def exec2_streaming(
     sandbox: SandboxEnvironment,
     cmd: list[str],
     options: Exec2Options | None = None,
@@ -376,7 +376,7 @@ def create_streamable_exec2(
     )
 
 
-def create_awaitable_exec2(
+def exec2_awaitable(
     sandbox: SandboxEnvironment,
     cmd: list[str],
     options: Exec2Options | None = None,

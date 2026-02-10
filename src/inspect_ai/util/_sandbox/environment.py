@@ -24,8 +24,8 @@ from .._subprocess import ExecResult
 from .exec2 import (
     Exec2Options,
     Exec2Process,
-    create_awaitable_exec2,
-    create_streamable_exec2,
+    exec2_awaitable,
+    exec2_streaming,
 )
 
 logger = logging.getLogger(__name__)
@@ -241,8 +241,9 @@ class SandboxEnvironment(abc.ABC):
     ) -> Exec2Process | Awaitable[ExecResult[str]]:
         """Start a command and return a handle or awaitable result.
 
-        The process starts immediately when this method is called.
-        Unlike exec(), exec2 does not block waiting for completion.
+        Both modes support automatic cleanup on cancellation: if the calling
+        task is cancelled (e.g., via task group cancellation), the subprocess
+        is automatically killed before the cancellation exception propagates.
 
         Usage patterns:
 
@@ -270,6 +271,14 @@ class SandboxEnvironment(abc.ABC):
                print(result.stdout)
            ```
 
+        4. Long-running process with automatic cleanup via task cancellation:
+           ```python
+           async with anyio.create_task_group() as tg:
+               tg.start_soon(run_server)  # uses exec2(..., stream=False)
+               yield  # do work while server runs
+               tg.cancel_scope.cancel()  # server killed automatically
+           ```
+
         Args:
             cmd: Command and arguments to execute.
             options: Execution options (see Exec2Options).
@@ -280,10 +289,11 @@ class SandboxEnvironment(abc.ABC):
             If stream=True: Exec2Process handle with events iterator and kill() method.
             If stream=False: Awaitable[ExecResult[str]] that can be awaited for the result.
         """
-        if stream:
-            return create_streamable_exec2(self, cmd, options)
-        else:
-            return create_awaitable_exec2(self, cmd, options)
+        return (
+            exec2_streaming(self, cmd, options)
+            if stream
+            else exec2_awaitable(self, cmd, options)
+        )
 
     def as_type(self, sandbox_cls: Type[ST]) -> ST:
         """Verify and return a reference to a subclass of SandboxEnvironment.
