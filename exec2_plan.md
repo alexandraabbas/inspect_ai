@@ -432,11 +432,91 @@ await proxy.kill()
 - [x] Export new types from public API
 
 ### Phase 4: Refactor model_proxy to use exec2
-- [ ] Update `run_model_proxy()` in `src/inspect_ai/agent/_bridge/sandbox/bridge.py` to use `exec2()`
-- [ ] Replace blocking `sandbox.exec()` call with fire-and-forget `sandbox.exec2()`
-- [ ] Store `Exec2Process` handle for cleanup
-- [ ] Call `await proxy.kill()` when bridge context exits
-- [ ] Update error handling for the new async pattern
+
+**Motivation**: The model_proxy is a long-running HTTP server that can run for an extremely long time (the duration of an agent task). The current approach uses a blocking `sandbox.exec()` call which has timeout/connectivity issues in K8s/Docker environments. Using exec2 provides proper lifecycle management for this long-running process.
+
+**Architecture Overview**:
+
+```
+Host (bridge.py)                          Sandbox
+─────────────────                         ───────
+sandbox_agent_bridge()
+  │
+  ├─ sandbox.exec2(["python", "proxy.py", port])
+  │     │
+  │     └─► exec_async_submit ──────────► Job spawns: python proxy.py 13131
+  │                                           │
+  │                                           ▼
+  │                                       model_proxy_server runs
+  │                                       (HTTP server on port 13131)
+  │
+  ├─ yield bridge  ◄─────────────────────► Agent makes API calls to proxy
+  │
+  └─ await proxy.kill()
+        │
+        └─► exec_async_kill ────────────► Job terminates proxy process
+```
+
+**Key Insight**: The proxy server code lives in `src/inspect_ai/agent/_bridge/sandbox/proxy.py` and is a self-contained async HTTP server with no inspect_ai dependencies. It can be run as a script:
+```python
+if __name__ == "__main__":
+    port_arg = int(sys.argv[1]) if len(sys.argv) > 1 else 13131
+    asyncio.run(run_model_proxy_server(port=port_arg))
+```
+
+**Build System Finding**:
+
+The proxy code (`inspect_sandbox_tools._agent_bridge.proxy`) is **already bundled** in the staticx executable because `main.py` imports it:
+```python
+from inspect_sandbox_tools._agent_bridge.proxy import run_model_proxy_server
+```
+
+PyInstaller traces all imports from the entry point (`main.py`) and includes them in the bundle. This means:
+- The proxy code is already available inside the sandbox (within the `inspect_sandbox_tools` executable)
+- We cannot use `python proxy.py` because the staticx bundle is a Python-less environment - there's no standalone Python interpreter, only the embedded one inside the bundle
+- The only way to execute Python code in the sandbox is through the bundled executable's CLI subcommands or JSON-RPC methods
+- Since the proxy needs to run as a **separate long-running process** (not just a method call within the existing server), we must use a CLI subcommand
+
+**Approach: Keep `model_proxy` subcommand, invoke via exec2**
+
+Keep the existing `model_proxy` CLI subcommand and invoke it via exec2 for proper lifecycle management:
+- Host-side calls: `sandbox.exec2([SANDBOX_TOOLS_CLI, "model_proxy"])`
+- exec2 sends `exec_async_submit` to spawn the proxy as a managed subprocess
+- Proxy runs until `exec_async_kill` terminates it
+
+**Implementation Tasks**:
+
+1. **Update host-side bridge.py**
+   - [ ] Change `run_model_proxy()` to use `sandbox.exec2()` instead of blocking `sandbox.exec()`
+   - [ ] Command: `[SANDBOX_TOOLS_CLI, "model_proxy"]`
+   - [ ] Pass environment variables via `Exec2Options(env={...})`
+   - [ ] Store `Exec2Process` handle on the bridge for cleanup
+
+2. **Update lifecycle management**
+   - [ ] Call `await proxy.kill()` in the finally block when bridge context exits
+   - [ ] Remove the task group cancellation approach (no longer needed)
+   - [ ] Handle case where proxy exits unexpectedly (check events for early Completed)
+
+3. **Error handling**
+   - [ ] If proxy fails to start, the Completed event will have non-zero exit_code
+   - [ ] stderr from proxy should be captured and logged on failure
+
+**JSON-RPC Flow**:
+
+When `sandbox.exec2([SANDBOX_TOOLS_CLI, "model_proxy"])` is called:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "method": "exec_async_submit",
+  "params": {
+    "command": "BRIDGE_MODEL_SERVICE_PORT='13131' BRIDGE_MODEL_SERVICE_INSTANCE='proxy_abc123' /path/to/inspect_sandbox_tools model_proxy"
+  },
+  "id": 1
+}
+```
+
+The exec_async controller spawns the `model_proxy` subcommand as a subprocess, and it runs indefinitely until killed via `exec_async_kill`.
 
 ### Phase 5: Testing
 - [ ] Unit tests for Job class (server layer)
