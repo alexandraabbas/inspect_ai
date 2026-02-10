@@ -682,6 +682,12 @@ Despite these differences, both features share underlying infrastructure in the 
 
 - [ ] **Process group handling for kill()**: `Job.create()` currently uses `create_subprocess_shell()` without `start_new_session=True`, so `kill()` only signals the direct child process, not grandchildren (e.g., jest workers spawned by the command). To properly handle process trees, add `start_new_session=True` when creating the subprocess and use `os.killpg()` instead of `process.terminate()`/`process.kill()` to send signals to the entire process group.
 
+- [ ] **Output limit support for exec2**: Add `output_limit` parameter to `Exec2Options` to cap memory usage for long-running processes, similar to the existing support in `docker.py`:
+  ```python
+  output_limit=SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE
+  ```
+  This would require server-side changes to limit buffered stdout/stderr in `_exec_async/_job.py`.
+
 ---
 
 ## Verification
