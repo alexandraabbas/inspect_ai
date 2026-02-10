@@ -9,7 +9,7 @@ from __future__ import annotations
 import shlex
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 from pydantic import BaseModel
 
@@ -122,10 +122,7 @@ DEFAULT_POLL_INTERVAL = 0.5
 RPC_TIMEOUT = 30
 """Timeout for individual JSON-RPC calls in seconds."""
 
-
-# ============================================================================
-# Exec2Process
-# ============================================================================
+T = TypeVar("T", bound=BaseModel)
 
 
 class Exec2Process:
@@ -153,31 +150,79 @@ class Exec2Process:
     def __init__(
         self,
         sandbox: SandboxEnvironment,
-        pid: int,
-        poll_interval: float,
-        user: str | None,
+        cmd: list[str],
+        options: Exec2Options,
     ) -> None:
-        """Initialize an Exec2Process handle.
-
-        This constructor is internal. Use sandbox.exec2() to create instances.
+        """Initialize an Exec2Process.
 
         Args:
-            sandbox: The sandbox environment where the process is running.
-            pid: The process ID returned from exec_async_submit.
-            poll_interval: Interval between poll requests.
-            user: User to run commands as (for RPC calls).
+            sandbox: The sandbox environment where the process will run.
+            cmd: Command and arguments to execute.
+            options: Execution options.
         """
         self._sandbox = sandbox
-        self._pid = pid
-        self._poll_interval = poll_interval
-        self._user = user
+        self._cmd = cmd
+        self._options = options
+        self._poll_interval = options.poll_interval or DEFAULT_POLL_INTERVAL
+        self._pid: int | None = None
         self._killed = False
         self._completed = False
 
     @property
     def pid(self) -> int:
         """Return the process ID."""
+        if self._pid is None:
+            raise RuntimeError("Process has not been submitted yet")
         return self._pid
+
+    # -------------------------------------------------------------------------
+    # RPC helpers
+    # -------------------------------------------------------------------------
+
+    async def _rpc(
+        self, method: str, params: dict[str, object], result_type: type[T]
+    ) -> T:
+        """Make an RPC call to the sandbox."""
+        transport = SandboxJSONRPCTransport(self._sandbox, SANDBOX_TOOLS_CLI)
+        server_error_mapper = SandboxToolsServerErrorMapper()
+        return await exec_model_request(
+            method=method,
+            params=params,
+            result_type=result_type,
+            transport=transport,
+            server_error_mapper=server_error_mapper,
+            timeout=RPC_TIMEOUT,
+            user=self._options.user,
+        )
+
+    def _build_shell_command(self) -> str:
+        """Build a shell command string from command list and options."""
+        shell_cmd = shlex.join(self._cmd)
+
+        # Add working directory if specified
+        if self._options.cwd:
+            shell_cmd = f"cd {shlex.quote(self._options.cwd)} && {shell_cmd}"
+
+        # Add environment variables if specified
+        if self._options.env:
+            env_prefix = " ".join(
+                f"{k}={shlex.quote(v)}" for k, v in self._options.env.items()
+            )
+            shell_cmd = f"{env_prefix} {shell_cmd}"
+
+        return shell_cmd
+
+    async def _submit(self) -> None:
+        """Submit the job to the sandbox."""
+        shell_cmd = self._build_shell_command()
+        result = await self._rpc(
+            "exec_async_submit", {"command": shell_cmd}, _SubmitResult
+        )
+        self._pid = result.pid
+
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
 
     @property
     async def events(self) -> AsyncIterator[Exec2Event]:
@@ -195,19 +240,13 @@ class Exec2Process:
 
         import anyio
 
-        transport = SandboxJSONRPCTransport(self._sandbox, SANDBOX_TOOLS_CLI)
-        server_error_mapper = SandboxToolsServerErrorMapper()
+        if self._pid is None:
+            raise RuntimeError("Process has not been submitted yet")
 
         try:
             while not self._completed and not self._killed:
-                result = await exec_model_request(
-                    method="exec_async_poll",
-                    params={"pid": self._pid},
-                    result_type=_PollResult,
-                    transport=transport,
-                    server_error_mapper=server_error_mapper,
-                    timeout=RPC_TIMEOUT,
-                    user=self._user,
+                result = await self._rpc(
+                    "exec_async_poll", {"pid": self._pid}, _PollResult
                 )
 
                 # Yield stdout chunks
@@ -243,85 +282,11 @@ class Exec2Process:
 
         If the process has already completed or been killed, this is a no-op.
         """
-        if self._completed or self._killed:
+        if self._pid is None or self._completed or self._killed:
             return
 
         self._killed = True
-
-        transport = SandboxJSONRPCTransport(self._sandbox, SANDBOX_TOOLS_CLI)
-        server_error_mapper = SandboxToolsServerErrorMapper()
-
-        await exec_model_request(
-            method="exec_async_kill",
-            params={"pid": self._pid},
-            result_type=_KillResult,
-            transport=transport,
-            server_error_mapper=server_error_mapper,
-            timeout=RPC_TIMEOUT,
-            user=self._user,
-        )
-
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-
-def _build_shell_command(cmd: list[str], options: Exec2Options) -> str:
-    """Build a shell command string from command list and options.
-
-    Args:
-        cmd: Command and arguments to execute.
-        options: Execution options.
-
-    Returns:
-        Shell command string with environment variables and working directory.
-    """
-    # exec_async uses create_subprocess_shell, so we need to pass a shell command string
-    shell_cmd = shlex.join(cmd)
-
-    # Add working directory if specified
-    if options.cwd:
-        shell_cmd = f"cd {shlex.quote(options.cwd)} && {shell_cmd}"
-
-    # Add environment variables if specified
-    if options.env:
-        env_prefix = " ".join(f"{k}={shlex.quote(v)}" for k, v in options.env.items())
-        shell_cmd = f"{env_prefix} {shell_cmd}"
-
-    return shell_cmd
-
-
-async def _submit_job(
-    sandbox: SandboxEnvironment,
-    cmd: list[str],
-    options: Exec2Options,
-) -> int:
-    """Submit a job to the sandbox and return the PID.
-
-    Args:
-        sandbox: The sandbox environment to run the command in.
-        cmd: Command and arguments to execute.
-        options: Execution options.
-
-    Returns:
-        The process ID of the submitted job.
-    """
-    shell_cmd = _build_shell_command(cmd, options)
-
-    transport = SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI)
-    server_error_mapper = SandboxToolsServerErrorMapper()
-
-    result = await exec_model_request(
-        method="exec_async_submit",
-        params={"command": shell_cmd},
-        result_type=_SubmitResult,
-        transport=transport,
-        server_error_mapper=server_error_mapper,
-        timeout=RPC_TIMEOUT,
-        user=options.user,
-    )
-    return result.pid
+        await self._rpc("exec_async_kill", {"pid": self._pid}, _KillResult)
 
 
 # ============================================================================
@@ -344,13 +309,9 @@ async def exec2_streaming(
     Returns:
         Exec2Process handle with events iterator and kill() method.
     """
-    options = options or Exec2Options()
-    return Exec2Process(
-        sandbox=sandbox,
-        pid=await _submit_job(sandbox, cmd, options),
-        poll_interval=options.poll_interval or DEFAULT_POLL_INTERVAL,
-        user=options.user,
-    )
+    proc = Exec2Process(sandbox, cmd, options or Exec2Options())
+    await proc._submit()
+    return proc
 
 
 async def exec2_awaitable(
