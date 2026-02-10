@@ -688,6 +688,32 @@ Despite these differences, both features share underlying infrastructure in the 
   ```
   This would require server-side changes to limit buffered stdout/stderr in `_exec_async/_job.py`.
 
+## Missing Options from `exec()`
+
+The goal is to support all the same options that `SandboxEnvironment.exec()` supports. The following are not yet implemented in `Exec2Options`:
+
+- [ ] **`input: str | bytes | None`** - Standard input to send to the command.
+  - Requires server-side changes: `exec_async_submit` currently only accepts a `command` string parameter
+  - Server needs to write input to the subprocess stdin pipe
+  - Consider whether to support streaming input or just initial input
+
+- [ ] **`timeout: int | None`** - Maximum execution time in seconds.
+  - Can be implemented client-side with `asyncio.timeout()` around the polling loop
+  - On timeout expiration, call `kill()` to terminate the process
+  - Should raise `TimeoutError` (consistent with `exec()` behavior)
+  - Consider interaction with `timeout_retry`
+
+- [ ] **`timeout_retry: bool`** - Whether to retry on timeout (default `True` in `exec()`).
+  - In `exec()`, this retries the entire command on timeout
+  - For exec2 streaming, retry semantics are unclear - would need to restart from scratch
+  - For exec2 awaitable mode, could implement similar retry logic
+  - May not make sense for streaming use case - consider omitting or documenting differently
+
+- [ ] **`concurrency: bool`** - Whether to allow concurrent execution (default `True` in `exec()`).
+  - In `exec()`, this controls whether multiple exec calls can run simultaneously
+  - For exec2, need to decide: does this apply per-sandbox or globally?
+  - May require coordination with existing concurrency control mechanisms
+
 ---
 
 ## Verification
