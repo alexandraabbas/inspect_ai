@@ -50,13 +50,9 @@ class Completed:
 
     Attributes:
         exit_code: The process exit code (0 = success).
-        stdout: Full accumulated stdout from the process.
-        stderr: Full accumulated stderr from the process.
     """
 
     exit_code: int
-    stdout: str
-    stderr: str
 
     @property
     def success(self) -> bool:
@@ -199,10 +195,6 @@ class Exec2Process:
 
         import anyio
 
-        # Accumulate full output for the Completed event
-        full_stdout: list[str] = []
-        full_stderr: list[str] = []
-
         transport = SandboxJSONRPCTransport(self._sandbox, SANDBOX_TOOLS_CLI)
         server_error_mapper = SandboxToolsServerErrorMapper()
 
@@ -220,23 +212,17 @@ class Exec2Process:
 
                 # Yield stdout chunks
                 if result.stdout:
-                    full_stdout.append(result.stdout)
                     yield StdoutChunk(data=result.stdout)
 
                 # Yield stderr chunks
                 if result.stderr:
-                    full_stderr.append(result.stderr)
                     yield StderrChunk(data=result.stderr)
 
                 # Check for terminal state
                 if result.state == "completed":
                     self._completed = True
                     assert result.exit_code is not None
-                    yield Completed(
-                        exit_code=result.exit_code,
-                        stdout="".join(full_stdout),
-                        stderr="".join(full_stderr),
-                    )
+                    yield Completed(exit_code=result.exit_code)
                 elif result.state == "killed":
                     # Process was killed (possibly by another call to kill())
                     self._killed = True
@@ -359,13 +345,10 @@ async def exec2_streaming(
         Exec2Process handle with events iterator and kill() method.
     """
     options = options or Exec2Options()
-    pid = await _submit_job(sandbox, cmd, options)
-    poll_interval = options.poll_interval or DEFAULT_POLL_INTERVAL
-
     return Exec2Process(
         sandbox=sandbox,
-        pid=pid,
-        poll_interval=poll_interval,
+        pid=await _submit_job(sandbox, cmd, options),
+        poll_interval=options.poll_interval or DEFAULT_POLL_INTERVAL,
         user=options.user,
     )
 
@@ -392,19 +375,27 @@ async def exec2_awaitable(
 
     proc = await exec2_streaming(sandbox, cmd, options)
 
+    # Accumulate output chunks
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+
     async for event in proc.events:
-        if isinstance(event, Completed):
+        if isinstance(event, StdoutChunk):
+            stdout_chunks.append(event.data)
+        elif isinstance(event, StderrChunk):
+            stderr_chunks.append(event.data)
+        elif isinstance(event, Completed):
             return ExecResultClass[str](
                 success=event.success,
                 returncode=event.exit_code,
-                stdout=event.stdout,
-                stderr=event.stderr,
+                stdout="".join(stdout_chunks),
+                stderr="".join(stderr_chunks),
             )
 
     # If we get here, the process was killed (no Completed event)
     return ExecResultClass[str](
         success=False,
         returncode=-1,
-        stdout="",
-        stderr="",
+        stdout="".join(stdout_chunks),
+        stderr="".join(stderr_chunks),
     )
