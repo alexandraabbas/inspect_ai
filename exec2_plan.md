@@ -431,7 +431,14 @@ await proxy.kill()
 - [x] Add `exec2()` method to SandboxEnvironment ABC
 - [x] Export new types from public API
 
-### Phase 4: Testing
+### Phase 4: Refactor model_proxy to use exec2
+- [ ] Update `run_model_proxy()` in `src/inspect_ai/agent/_bridge/sandbox/bridge.py` to use `exec2()`
+- [ ] Replace blocking `sandbox.exec()` call with fire-and-forget `sandbox.exec2()`
+- [ ] Store `Exec2Process` handle for cleanup
+- [ ] Call `await proxy.kill()` when bridge context exits
+- [ ] Update error handling for the new async pattern
+
+### Phase 5: Testing
 - [ ] Unit tests for Job class (server layer)
 - [ ] Unit tests for Controller (server layer)
 - [ ] Unit tests for Exec2Process (mock CLI calls)
@@ -552,6 +559,8 @@ Despite these differences, both features share underlying infrastructure in the 
 - [ ] **Rename `_remote_tools` directory**: The name `_remote_tools` is misleading now that it contains `_exec_async`, which is infrastructure rather than a tool. Consider renaming to `_remote_services` or `_json_rpc_services` to better reflect that it contains both tools (like `bash_session`) and infrastructure (like `exec_async`). Add a TODO comment in the code when creating the `_exec_async` directory.
 
 - [ ] **Replace `ToolException` usage**: `exec_async` uses `ToolException` for error handling, but since exec_async isn't a tool, this is semantically incorrect. Consider creating a more general exception type (e.g., `ServiceException` or `JsonRpcException`) or using a standard exception type.
+
+- [ ] **Process group handling for kill()**: `Job.create()` currently uses `create_subprocess_shell()` without `start_new_session=True`, so `kill()` only signals the direct child process, not grandchildren (e.g., jest workers spawned by the command). To properly handle process trees, add `start_new_session=True` when creating the subprocess and use `os.killpg()` instead of `process.terminate()`/`process.kill()` to send signals to the entire process group.
 
 ---
 
