@@ -365,6 +365,9 @@ async def exec2_awaitable(
     Submits the command, polls until completion, and returns ExecResult.
     If cancelled, the process will be killed before re-raising the exception.
 
+    Each output stream (stdout and stderr) is limited to 10 MiB. If output
+    exceeds this limit, only the most recent 10 MiB is kept.
+
     Args:
         sandbox: The sandbox environment to run the command in.
         cmd: Command and arguments to execute.
@@ -373,31 +376,34 @@ async def exec2_awaitable(
     Returns:
         ExecResult[str] with success, returncode, stdout, and stderr.
     """
+    from .._subprocess import CircularByteBuffer
     from .._subprocess import ExecResult as ExecResultClass
+    from .limits import SandboxEnvironmentLimits
 
     proc = await exec2_streaming(sandbox, cmd, options)
 
-    # Accumulate output chunks
-    stdout_chunks: list[str] = []
-    stderr_chunks: list[str] = []
+    # Accumulate output chunks with memory limiting
+    output_limit = SandboxEnvironmentLimits.MAX_EXEC_OUTPUT_SIZE
+    stdout_buffer = CircularByteBuffer(output_limit)
+    stderr_buffer = CircularByteBuffer(output_limit)
 
     async for event in proc:
         if isinstance(event, StdoutChunk):
-            stdout_chunks.append(event.data)
+            stdout_buffer.write(event.data.encode("utf-8"))
         elif isinstance(event, StderrChunk):
-            stderr_chunks.append(event.data)
+            stderr_buffer.write(event.data.encode("utf-8"))
         elif isinstance(event, Completed):
             return ExecResultClass[str](
                 success=event.success,
                 returncode=event.exit_code,
-                stdout="".join(stdout_chunks),
-                stderr="".join(stderr_chunks),
+                stdout=stdout_buffer.getvalue().decode("utf-8", errors="replace"),
+                stderr=stderr_buffer.getvalue().decode("utf-8", errors="replace"),
             )
 
     # If we get here, the process was killed (no Completed event)
     return ExecResultClass[str](
         success=False,
         returncode=-1,
-        stdout="".join(stdout_chunks),
-        stderr="".join(stderr_chunks),
+        stdout=stdout_buffer.getvalue().decode("utf-8", errors="replace"),
+        stderr=stderr_buffer.getvalue().decode("utf-8", errors="replace"),
     )
