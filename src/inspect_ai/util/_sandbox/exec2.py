@@ -197,8 +197,12 @@ class Exec2Process:
 
         Note: After the Completed event is yielded, the job is automatically
         cleaned up on the server side. Subsequent calls will raise an error.
+
+        If cancelled, the process will be killed before re-raising the exception.
         """
         import asyncio
+
+        import anyio
 
         # Accumulate full output for the Completed event
         full_stdout: list[str] = []
@@ -207,43 +211,48 @@ class Exec2Process:
         transport = SandboxJSONRPCTransport(self._sandbox, SANDBOX_TOOLS_CLI)
         server_error_mapper = SandboxToolsServerErrorMapper()
 
-        while not self._completed and not self._killed:
-            result = await exec_model_request(
-                method="exec_async_poll",
-                params={"pid": self._pid},
-                result_type=_PollResult,
-                transport=transport,
-                server_error_mapper=server_error_mapper,
-                timeout=RPC_TIMEOUT,
-                user=self._user,
-            )
-
-            # Yield stdout chunks
-            if result.stdout:
-                full_stdout.append(result.stdout)
-                yield StdoutChunk(data=result.stdout)
-
-            # Yield stderr chunks
-            if result.stderr:
-                full_stderr.append(result.stderr)
-                yield StderrChunk(data=result.stderr)
-
-            # Check for terminal state
-            if result.state == "completed":
-                self._completed = True
-                assert result.exit_code is not None
-                yield Completed(
-                    exit_code=result.exit_code,
-                    stdout="".join(full_stdout),
-                    stderr="".join(full_stderr),
+        try:
+            while not self._completed and not self._killed:
+                result = await exec_model_request(
+                    method="exec_async_poll",
+                    params={"pid": self._pid},
+                    result_type=_PollResult,
+                    transport=transport,
+                    server_error_mapper=server_error_mapper,
+                    timeout=RPC_TIMEOUT,
+                    user=self._user,
                 )
-            elif result.state == "killed":
-                # Process was killed (possibly by another call to kill())
-                self._killed = True
-                # Don't yield Completed for killed processes - kill() discards output
-            else:
-                # Still running, wait before polling again
-                await asyncio.sleep(self._poll_interval)
+
+                # Yield stdout chunks
+                if result.stdout:
+                    full_stdout.append(result.stdout)
+                    yield StdoutChunk(data=result.stdout)
+
+                # Yield stderr chunks
+                if result.stderr:
+                    full_stderr.append(result.stderr)
+                    yield StderrChunk(data=result.stderr)
+
+                # Check for terminal state
+                if result.state == "completed":
+                    self._completed = True
+                    assert result.exit_code is not None
+                    yield Completed(
+                        exit_code=result.exit_code,
+                        stdout="".join(full_stdout),
+                        stderr="".join(full_stderr),
+                    )
+                elif result.state == "killed":
+                    # Process was killed (possibly by another call to kill())
+                    self._killed = True
+                    # Don't yield Completed for killed processes - kill() discards output
+                else:
+                    # Still running, wait before polling again
+                    await asyncio.sleep(self._poll_interval)
+        except anyio.get_cancelled_exc_class():
+            # Kill the process on cancellation to avoid leaving orphaned processes
+            await self.kill()
+            raise
 
     async def kill(self) -> None:
         """Terminate the process.
@@ -398,6 +407,8 @@ async def _exec2_await_impl(
 
     Submits the command, polls until completion, and returns ExecResult.
 
+    If cancelled, the process will be killed before re-raising the exception.
+
     Args:
         sandbox: The sandbox environment to run the command in.
         cmd: Command and arguments to execute.
@@ -407,6 +418,8 @@ async def _exec2_await_impl(
         ExecResult[str] with success, returncode, stdout, and stderr.
     """
     import asyncio
+
+    import anyio
 
     from .._subprocess import ExecResult as ExecResultClass
 
@@ -433,41 +446,58 @@ async def _exec2_await_impl(
     full_stdout: list[str] = []
     full_stderr: list[str] = []
 
-    # Poll until completion
-    while True:
-        result = await exec_model_request(
-            method="exec_async_poll",
+    # Helper to kill the process (used on cancellation)
+    async def kill_process() -> None:
+        await exec_model_request(
+            method="exec_async_kill",
             params={"pid": pid},
-            result_type=_PollResult,
+            result_type=_KillResult,
             transport=transport,
             server_error_mapper=server_error_mapper,
             timeout=RPC_TIMEOUT,
             user=options.user,
         )
 
-        # Accumulate output
-        if result.stdout:
-            full_stdout.append(result.stdout)
-        if result.stderr:
-            full_stderr.append(result.stderr)
+    # Poll until completion
+    try:
+        while True:
+            result = await exec_model_request(
+                method="exec_async_poll",
+                params={"pid": pid},
+                result_type=_PollResult,
+                transport=transport,
+                server_error_mapper=server_error_mapper,
+                timeout=RPC_TIMEOUT,
+                user=options.user,
+            )
 
-        # Check for terminal state
-        if result.state == "completed":
-            assert result.exit_code is not None
-            return ExecResultClass[str](
-                success=result.exit_code == 0,
-                returncode=result.exit_code,
-                stdout="".join(full_stdout),
-                stderr="".join(full_stderr),
-            )
-        elif result.state == "killed":
-            # Process was killed externally
-            return ExecResultClass[str](
-                success=False,
-                returncode=-1,
-                stdout="".join(full_stdout),
-                stderr="".join(full_stderr),
-            )
-        else:
-            # Still running, wait before polling again
-            await asyncio.sleep(poll_interval)
+            # Accumulate output
+            if result.stdout:
+                full_stdout.append(result.stdout)
+            if result.stderr:
+                full_stderr.append(result.stderr)
+
+            # Check for terminal state
+            if result.state == "completed":
+                assert result.exit_code is not None
+                return ExecResultClass[str](
+                    success=result.exit_code == 0,
+                    returncode=result.exit_code,
+                    stdout="".join(full_stdout),
+                    stderr="".join(full_stderr),
+                )
+            elif result.state == "killed":
+                # Process was killed externally
+                return ExecResultClass[str](
+                    success=False,
+                    returncode=-1,
+                    stdout="".join(full_stdout),
+                    stderr="".join(full_stderr),
+                )
+            else:
+                # Still running, wait before polling again
+                await asyncio.sleep(poll_interval)
+    except anyio.get_cancelled_exc_class():
+        # Kill the process on cancellation to avoid leaving orphaned processes
+        await kill_process()
+        raise
