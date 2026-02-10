@@ -6,10 +6,12 @@ long-running commands in sandbox environments with streaming output.
 
 from __future__ import annotations
 
+import asyncio
 import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, TypeVar
 
+import anyio
 from pydantic import BaseModel
 
 from inspect_ai.tool._json_rpc_helpers import exec_model_request
@@ -171,6 +173,8 @@ class Exec2Process:
         self._completed = False
         self._iteration_started = False
         self._pending_events: list[Exec2Event] = []
+        self._transport = SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI)
+        self._error_mapper = SandboxToolsServerErrorMapper()
 
     @property
     def pid(self) -> int:
@@ -187,14 +191,12 @@ class Exec2Process:
         self, method: str, params: dict[str, object], result_type: type[T]
     ) -> T:
         """Make an RPC call to the sandbox."""
-        transport = SandboxJSONRPCTransport(self._sandbox, SANDBOX_TOOLS_CLI)
-        server_error_mapper = SandboxToolsServerErrorMapper()
         return await exec_model_request(
             method=method,
             params=params,
             result_type=result_type,
-            transport=transport,
-            server_error_mapper=server_error_mapper,
+            transport=self._transport,
+            server_error_mapper=self._error_mapper,
             timeout=RPC_TIMEOUT,
             user=self._options.user,
         )
@@ -259,10 +261,6 @@ class Exec2Process:
             StopAsyncIteration: When the process has completed or been killed.
             RuntimeError: If the process has not been submitted yet.
         """
-        import asyncio
-
-        import anyio
-
         if self._pid is None:
             raise RuntimeError("Process has not been submitted yet")
 
