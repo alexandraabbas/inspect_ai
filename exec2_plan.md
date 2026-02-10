@@ -518,7 +518,48 @@ When `sandbox.exec2([SANDBOX_TOOLS_CLI, "model_proxy"])` is called:
 
 The exec_async controller spawns the `model_proxy` subcommand as a subprocess, and it runs indefinitely until killed via `exec_async_kill`.
 
-### Phase 5: Testing
+### Phase 5: Add exec2 overload for simple await use case
+
+**Motivation**: Many use cases for exec2 don't need streaming output - they just want to run a command asynchronously without blocking the entire sandbox connection. For these cases, having to iterate through `events` and handle `StdoutChunk`/`StderrChunk`/`Completed` is unnecessarily complex.
+
+**Design**: Add an overload to `exec2()` that returns `ExecResult[str]` directly (same type as `exec()`):
+
+```python
+# Streaming mode (existing) - returns Exec2Process
+proc = sandbox.exec2(["pytest", "-v"])
+async for event in proc.events:
+    ...
+
+# Simple await mode (new) - returns ExecResult[str]
+result = await sandbox.exec2(["pytest", "-v"], stream=False)
+if result.success:
+    print(result.stdout)
+```
+
+**Implementation**:
+
+1. **Add overloads to `SandboxEnvironment.exec2()`**
+   - [ ] Overload 1: `exec2(cmd, options, stream=True) -> Exec2Process` (default, existing behavior)
+   - [ ] Overload 2: `exec2(cmd, options, stream=False) -> Awaitable[ExecResult[str]]`
+   - [ ] Implementation dispatches based on `stream` parameter
+
+2. **Update `Exec2Options`**
+   - [ ] Consider if any options need adjustment for non-streaming mode
+
+3. **Implementation for non-streaming mode**
+   - [ ] Start process with `exec_async_submit` (same as streaming)
+   - [ ] Internally iterate through events, accumulating stdout/stderr
+   - [ ] Return `ExecResult[str]` when `Completed` event is received
+
+4. **Exports**
+   - [ ] No new types needed - reuses existing `ExecResult[str]`
+
+**Alternative design considered**: A separate method like `exec2_await()`. Rejected because:
+- Overloads keep the API surface smaller
+- The `stream=False` parameter clearly expresses intent
+- Similar pattern to other Python APIs
+
+### Phase 6: Testing
 - [ ] Unit tests for Job class (server layer)
 - [ ] Unit tests for Controller (server layer)
 - [ ] Unit tests for Exec2Process (mock CLI calls)
