@@ -215,7 +215,7 @@ class SandboxEnvironment(abc.ABC):
         raise NotImplementedError("connection not implemented")
 
     @overload
-    def exec2(
+    async def exec2(
         self,
         cmd: list[str],
         options: Exec2Options | None = None,
@@ -224,22 +224,22 @@ class SandboxEnvironment(abc.ABC):
     ) -> Exec2Process: ...
 
     @overload
-    def exec2(
+    async def exec2(
         self,
         cmd: list[str],
         options: Exec2Options | None = None,
         *,
         stream: Literal[False],
-    ) -> Awaitable[ExecResult[str]]: ...
+    ) -> ExecResult[str]: ...
 
-    def exec2(
+    async def exec2(
         self,
         cmd: list[str],
         options: Exec2Options | None = None,
         *,
         stream: bool = True,
-    ) -> Exec2Process | Awaitable[ExecResult[str]]:
-        """Start a command and return a handle or awaitable result.
+    ) -> Exec2Process | ExecResult[str]:
+        """Start a command and return a process handle or result.
 
         Both modes support automatic cleanup on cancellation: if the calling
         task is cancelled (e.g., via task group cancellation), the subprocess
@@ -249,7 +249,7 @@ class SandboxEnvironment(abc.ABC):
 
         1. Streaming (stream=True, default): iterate over events
            ```python
-           proc = sandbox.exec2(["pytest", "-v"])
+           proc = await sandbox.exec2(["pytest", "-v"])
            async for event in proc.events:
                match event:
                    case StdoutChunk(data=data): print(data, end="")
@@ -259,7 +259,7 @@ class SandboxEnvironment(abc.ABC):
 
         2. Fire-and-forget with explicit kill:
            ```python
-           proxy = sandbox.exec2(["./model-proxy"])  # starts immediately
+           proxy = await sandbox.exec2(["./model-proxy"])
            # ... do other work ...
            await proxy.kill()  # terminate when done
            ```
@@ -283,17 +283,16 @@ class SandboxEnvironment(abc.ABC):
             cmd: Command and arguments to execute.
             options: Execution options (see Exec2Options).
             stream: If True (default), returns Exec2Process for streaming.
-                If False, returns an awaitable that yields ExecResult[str].
+                If False, returns ExecResult[str] directly.
 
         Returns:
             If stream=True: Exec2Process handle with events iterator and kill() method.
-            If stream=False: Awaitable[ExecResult[str]] that can be awaited for the result.
+            If stream=False: ExecResult[str] with success, returncode, stdout, and stderr.
         """
-        return (
-            exec2_streaming(self, cmd, options)
-            if stream
-            else exec2_awaitable(self, cmd, options)
-        )
+        if stream:
+            return await exec2_streaming(self, cmd, options)
+        else:
+            return await exec2_awaitable(self, cmd, options)
 
     def as_type(self, sandbox_cls: Type[ST]) -> ST:
         """Verify and return a reference to a subclass of SandboxEnvironment.

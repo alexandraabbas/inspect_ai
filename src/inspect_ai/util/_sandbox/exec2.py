@@ -2,17 +2,14 @@
 
 This module provides the host-side implementation for exec2, enabling
 long-running commands in sandbox environments with streaming output.
-
-Unlike exec() which blocks until completion, exec2() starts the process
-immediately and provides streaming output via an async iterator.
 """
 
 from __future__ import annotations
 
 import shlex
-from collections.abc import AsyncIterator, Coroutine
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel
 
@@ -138,13 +135,11 @@ RPC_TIMEOUT = 30
 class Exec2Process:
     """Handle to a running exec2 process.
 
-    The process starts immediately when exec2() is called - it's "hot" from creation.
-
     Usage patterns:
 
     1. Streaming: iterate over events
        ```python
-       proc = sandbox.exec2(["cmd"])
+       proc = await sandbox.exec2(["cmd"])
        async for event in proc.events:
            match event:
                case StdoutChunk(data=data): print(data)
@@ -153,7 +148,7 @@ class Exec2Process:
 
     2. Fire-and-forget with explicit kill:
        ```python
-       proxy = sandbox.exec2(["./proxy"])  # starts immediately
+       proxy = await sandbox.exec2(["./proxy"])
        # ... do other work ...
        await proxy.kill()  # terminate when done
        ```
@@ -282,7 +277,7 @@ class Exec2Process:
 
 
 # ============================================================================
-# Factory Function
+# Helper Functions
 # ============================================================================
 
 
@@ -311,16 +306,49 @@ def _build_shell_command(cmd: list[str], options: Exec2Options) -> str:
     return shell_cmd
 
 
-def exec2_streaming(
+async def _submit_job(
+    sandbox: SandboxEnvironment,
+    cmd: list[str],
+    options: Exec2Options,
+) -> int:
+    """Submit a job to the sandbox and return the PID.
+
+    Args:
+        sandbox: The sandbox environment to run the command in.
+        cmd: Command and arguments to execute.
+        options: Execution options.
+
+    Returns:
+        The process ID of the submitted job.
+    """
+    shell_cmd = _build_shell_command(cmd, options)
+
+    transport = SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI)
+    server_error_mapper = SandboxToolsServerErrorMapper()
+
+    result = await exec_model_request(
+        method="exec_async_submit",
+        params={"command": shell_cmd},
+        result_type=_SubmitResult,
+        transport=transport,
+        server_error_mapper=server_error_mapper,
+        timeout=RPC_TIMEOUT,
+        user=options.user,
+    )
+    return result.pid
+
+
+# ============================================================================
+# Factory Functions
+# ============================================================================
+
+
+async def exec2_streaming(
     sandbox: SandboxEnvironment,
     cmd: list[str],
     options: Exec2Options | None = None,
 ) -> Exec2Process:
-    """Create and start an exec2 process.
-
-    This is an internal function called by SandboxEnvironment.exec2().
-    It makes a synchronous (blocking) call to submit the job and returns
-    an Exec2Process handle.
+    """Create and start an exec2 process for streaming.
 
     Args:
         sandbox: The sandbox environment to run the command in.
@@ -330,42 +358,8 @@ def exec2_streaming(
     Returns:
         Exec2Process handle with events iterator and kill() method.
     """
-    import asyncio
-
     options = options or Exec2Options()
-    shell_cmd = _build_shell_command(cmd, options)
-
-    # Submit the job synchronously using asyncio.run or get_event_loop
-    # We need to handle both cases: when there's an existing event loop and when there isn't
-    transport = SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI)
-    server_error_mapper = SandboxToolsServerErrorMapper()
-
-    async def submit() -> int:
-        result = await exec_model_request(
-            method="exec_async_submit",
-            params={"command": shell_cmd},
-            result_type=_SubmitResult,
-            transport=transport,
-            server_error_mapper=server_error_mapper,
-            timeout=RPC_TIMEOUT,
-            user=options.user,
-        )
-        return result.pid
-
-    # Get or create event loop and run the submit coroutine
-    try:
-        asyncio.get_running_loop()
-        # We're in an async context but exec2() is sync, so we need to block
-        # This should not happen in practice since exec2() is called from sync code
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future = executor.submit(asyncio.run, submit())
-            pid = future.result()
-    except RuntimeError:
-        # No running event loop, we can use asyncio.run
-        pid = asyncio.run(submit())
-
+    pid = await _submit_job(sandbox, cmd, options)
     poll_interval = options.poll_interval or DEFAULT_POLL_INTERVAL
 
     return Exec2Process(
@@ -376,37 +370,14 @@ def exec2_streaming(
     )
 
 
-def exec2_awaitable(
-    sandbox: SandboxEnvironment,
-    cmd: list[str],
-    options: Exec2Options | None = None,
-) -> Coroutine[Any, Any, ExecResult[str]]:
-    """Create an awaitable that runs the command and returns ExecResult.
-
-    This is an internal function called by SandboxEnvironment.exec2(stream=False).
-    Unlike _create_exec2_process, this returns a coroutine that can be awaited
-    to get the final result without streaming events.
-
-    Args:
-        sandbox: The sandbox environment to run the command in.
-        cmd: Command and arguments to execute.
-        options: Execution options.
-
-    Returns:
-        Coroutine that yields ExecResult[str] when awaited.
-    """
-    return _exec2_await_impl(sandbox, cmd, options)
-
-
-async def _exec2_await_impl(
+async def exec2_awaitable(
     sandbox: SandboxEnvironment,
     cmd: list[str],
     options: Exec2Options | None = None,
 ) -> ExecResult[str]:
-    """Implementation of the non-streaming exec2 await.
+    """Run a command and return the result without streaming.
 
     Submits the command, polls until completion, and returns ExecResult.
-
     If cancelled, the process will be killed before re-raising the exception.
 
     Args:
@@ -417,87 +388,23 @@ async def _exec2_await_impl(
     Returns:
         ExecResult[str] with success, returncode, stdout, and stderr.
     """
-    import asyncio
-
-    import anyio
-
     from .._subprocess import ExecResult as ExecResultClass
 
-    options = options or Exec2Options()
-    shell_cmd = _build_shell_command(cmd, options)
-    poll_interval = options.poll_interval or DEFAULT_POLL_INTERVAL
+    proc = await exec2_streaming(sandbox, cmd, options)
 
-    transport = SandboxJSONRPCTransport(sandbox, SANDBOX_TOOLS_CLI)
-    server_error_mapper = SandboxToolsServerErrorMapper()
-
-    # Submit the job
-    submit_result = await exec_model_request(
-        method="exec_async_submit",
-        params={"command": shell_cmd},
-        result_type=_SubmitResult,
-        transport=transport,
-        server_error_mapper=server_error_mapper,
-        timeout=RPC_TIMEOUT,
-        user=options.user,
-    )
-    pid = submit_result.pid
-
-    # Accumulate output
-    full_stdout: list[str] = []
-    full_stderr: list[str] = []
-
-    # Helper to kill the process (used on cancellation)
-    async def kill_process() -> None:
-        await exec_model_request(
-            method="exec_async_kill",
-            params={"pid": pid},
-            result_type=_KillResult,
-            transport=transport,
-            server_error_mapper=server_error_mapper,
-            timeout=RPC_TIMEOUT,
-            user=options.user,
-        )
-
-    # Poll until completion
-    try:
-        while True:
-            result = await exec_model_request(
-                method="exec_async_poll",
-                params={"pid": pid},
-                result_type=_PollResult,
-                transport=transport,
-                server_error_mapper=server_error_mapper,
-                timeout=RPC_TIMEOUT,
-                user=options.user,
+    async for event in proc.events:
+        if isinstance(event, Completed):
+            return ExecResultClass[str](
+                success=event.success,
+                returncode=event.exit_code,
+                stdout=event.stdout,
+                stderr=event.stderr,
             )
 
-            # Accumulate output
-            if result.stdout:
-                full_stdout.append(result.stdout)
-            if result.stderr:
-                full_stderr.append(result.stderr)
-
-            # Check for terminal state
-            if result.state == "completed":
-                assert result.exit_code is not None
-                return ExecResultClass[str](
-                    success=result.exit_code == 0,
-                    returncode=result.exit_code,
-                    stdout="".join(full_stdout),
-                    stderr="".join(full_stderr),
-                )
-            elif result.state == "killed":
-                # Process was killed externally
-                return ExecResultClass[str](
-                    success=False,
-                    returncode=-1,
-                    stdout="".join(full_stdout),
-                    stderr="".join(full_stderr),
-                )
-            else:
-                # Still running, wait before polling again
-                await asyncio.sleep(poll_interval)
-    except anyio.get_cancelled_exc_class():
-        # Kill the process on cancellation to avoid leaving orphaned processes
-        await kill_process()
-        raise
+    # If we get here, the process was killed (no Completed event)
+    return ExecResultClass[str](
+        success=False,
+        returncode=-1,
+        stdout="",
+        stderr="",
+    )
